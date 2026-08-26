@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -55,6 +55,7 @@ const INLINE_ATTACHMENT_TYPES = new Set([
 const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
 const TRUSTED_ORIGINS_ENV = "CODEX_TASKBOARD_TRUSTED_ORIGINS";
+const TRUSTED_HOSTS_ENV = "CODEX_TASKBOARD_TRUSTED_HOSTS";
 const CODEX_AGENT_ACTOR = {
   type: "agent",
   id: "codex-agent",
@@ -143,8 +144,9 @@ function normalizeHostname(hostname) {
   return hostname.toLowerCase().replace(/^\[|\]$/g, "");
 }
 
-function isTrustedNetworkHost(hostname) {
+function isTrustedNetworkHost(hostname, trustedHosts = new Set()) {
   const host = normalizeHostname(hostname);
+  if (trustedHosts.has(host)) return true;
   if (host === "localhost" || host === "::1" || host.endsWith(".local")) return true;
   if (isIP(host) === 4) {
     const octets = host.split(".").map(Number);
@@ -199,14 +201,39 @@ function parseTrustedOrigins(value) {
   return origins;
 }
 
-function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trustedOrigins = new Set()) {
+function parseTrustedHosts(value) {
+  if (value === undefined) return new Set();
+  const configured = String(value).trim();
+  if (!configured) {
+    throw new Error(`${TRUSTED_HOSTS_ENV} must not be empty when configured`);
+  }
+  const hosts = new Set();
+  for (const rawHost of configured.split(",")) {
+    const host = normalizeHostname(rawHost.trim());
+    if (!host || host !== rawHost.trim() || host.includes("*") || /[/:@?#[\]]/.test(host)) {
+      throw new Error(`${TRUSTED_HOSTS_ENV} must be a comma-separated list of exact hostnames`);
+    }
+    if (hosts.has(host)) {
+      throw new Error(`${TRUSTED_HOSTS_ENV} must not contain duplicate hostnames`);
+    }
+    hosts.add(host);
+  }
+  return hosts;
+}
+
+function assertTrustedNetworkRequest(
+  request,
+  allowOpaqueOrigin = false,
+  trustedOrigins = new Set(),
+  trustedHosts = new Set(),
+) {
   let host;
   try {
     host = new URL(`http://${request.headers.host ?? ""}`).hostname;
   } catch {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
   }
-  if (!isTrustedNetworkHost(host)) {
+  if (!isTrustedNetworkHost(host, trustedHosts)) {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
   }
 
@@ -221,7 +248,7 @@ function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trusted
   } catch {
     throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
   }
-  if (!isTrustedNetworkHost(originHost)) {
+  if (!isTrustedNetworkHost(originHost, trustedHosts)) {
     throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
   }
 }
@@ -554,6 +581,25 @@ function parseThreadBinding(value) {
 function requestHeader(request, name) {
   const value = request.headers[name];
   return Array.isArray(value) ? value[0] : value;
+}
+
+function assertSharedSecretRequest(request, sharedSecret) {
+  const match = /^Basic (.+)$/.exec(requestHeader(request, "authorization") ?? "");
+  let password = null;
+  if (match) {
+    const decoded = Buffer.from(match[1], "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+    if (separator !== -1) password = decoded.slice(separator + 1);
+  }
+  const expected = Buffer.from(sharedSecret, "utf8");
+  const provided = Buffer.from(password ?? "", "utf8");
+  if (
+    password === null
+    || provided.length !== expected.length
+    || !timingSafeEqual(provided, expected)
+  ) {
+    throw new ApiError(401, "UNAUTHORIZED", "Shared key authentication is required");
+  }
 }
 
 function actorFromRequest(request) {
@@ -1381,6 +1427,8 @@ function parseComposerTurn(body) {
 class EventHub {
   constructor() {
     this.clients = new Set();
+    this.revision = 0;
+    this.revisionSink = null;
     this.keepAlive = setInterval(() => {
       for (const response of this.clients) response.write(": keep-alive\n\n");
     }, 20_000);
@@ -1409,6 +1457,8 @@ class EventHub {
     };
     const message = `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
     for (const response of this.clients) response.write(message);
+    this.revision += 1;
+    if (this.revisionSink) this.revisionSink(this.revision);
   }
 
   close() {
@@ -1604,6 +1654,9 @@ export function resolveServerOptions(options = {}) {
   if (instanceToken && !/^[a-f0-9-]{32,128}$/i.test(instanceSecret)) {
     throw new Error("CODEX_TASKBOARD_INSTANCE_SECRET must be set in launcher mode");
   }
+  const sharedSecret = String(
+    options.sharedSecret ?? environment.CODEX_TASKBOARD_SHARED_SECRET ?? "",
+  ).trim();
   return {
     dataDirectory,
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
@@ -1622,7 +1675,9 @@ export function resolveServerOptions(options = {}) {
       ?? path.join(codexHome, "process_manager", "chat_processes.json"),
     instanceToken,
     instanceSecret,
+    sharedSecret: sharedSecret || null,
     trustedOrigins: parseTrustedOrigins(environment[TRUSTED_ORIGINS_ENV]),
+    trustedHosts: parseTrustedHosts(environment[TRUSTED_HOSTS_ENV]),
     version: String(
       options.version ?? environment.CODEX_TASKBOARD_VERSION ?? "development",
     ).trim(),
@@ -1653,6 +1708,15 @@ export function createTaskboardServer(options = {}) {
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const events = new EventHub();
+  const realtimeRevisionSockets = new Set();
+  events.revisionSink = (revision) => {
+    const message = JSON.stringify({ type: "revision", revision });
+    for (const webSocket of realtimeRevisionSockets) {
+      try {
+        webSocket.send(message);
+      } catch {}
+    }
+  };
   let clientStorageWrite = Promise.resolve();
 
   async function readClientStorage() {
@@ -1986,10 +2050,18 @@ export function createTaskboardServer(options = {}) {
         request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
       }
 
+      if (resolved.sharedSecret) {
+        const gatedPathname = new URL(request.url, "http://127.0.0.1").pathname;
+        if (gatedPathname !== "/health") {
+          assertSharedSecretRequest(request, resolved.sharedSecret);
+        }
+      }
+
       assertTrustedNetworkRequest(
         request,
         Boolean(resolved.instanceToken),
         resolved.trustedOrigins,
+        resolved.trustedHosts,
       );
       const origin = request.headers.origin;
       const trustedEmbedOrigin = TRUSTED_EMBED_ORIGINS.has(origin)
@@ -3220,7 +3292,9 @@ export function createTaskboardServer(options = {}) {
       if (error instanceof ApiError) {
         const payload = { error: { code: error.code, message: error.message } };
         if (error.details !== undefined) payload.error.details = error.details;
-        sendJson(response, error.status, payload);
+        sendJson(response, error.status, payload, error.status === 401
+          ? { "www-authenticate": 'Basic realm="Codex Taskboard", charset="UTF-8"' }
+          : {});
         return;
       }
       if (error instanceof CloudProxyError) {
@@ -3272,14 +3346,29 @@ export function createTaskboardServer(options = {}) {
         }
         request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
       }
+      if (resolved.sharedSecret) {
+        assertSharedSecretRequest(request, resolved.sharedSecret);
+      }
       assertTrustedNetworkRequest(
         request,
         Boolean(resolved.instanceToken),
         resolved.trustedOrigins,
+        resolved.trustedHosts,
       );
       const url = new URL(request.url, "http://127.0.0.1");
       if (url.pathname !== "/api/events" || [...url.searchParams.keys()].length > 0) {
         rejectWebSocketUpgrade(socket, 404, "Not Found");
+        return;
+      }
+      const cloudConfigured = Boolean((await cloudConfig.read()).remoteUrl);
+      if (!cloudConfigured) {
+        cloudRealtimeServer.handleUpgrade(request, socket, head, (localSocket) => {
+          realtimeRevisionSockets.add(localSocket);
+          localSocket.on("message", () => {
+            localSocket.close(1008, "Client messages are not supported");
+          });
+          localSocket.on("close", () => realtimeRevisionSockets.delete(localSocket));
+        });
         return;
       }
       assertLoopbackRequest(request);
@@ -3385,6 +3474,8 @@ export function createTaskboardServer(options = {}) {
         remoteSocket.terminate();
       }
       cloudRealtimeSockets.clear();
+      for (const webSocket of realtimeRevisionSockets) webSocket.terminate();
+      realtimeRevisionSockets.clear();
       cloudRealtimeServer.close();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {

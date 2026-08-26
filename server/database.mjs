@@ -2056,6 +2056,7 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    this.#assertThreadBindingOwnership(current, threadBinding, threadId);
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
@@ -2197,6 +2198,7 @@ export class TaskboardDatabase {
     if (current.archivedAt !== null) {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
     }
+    this.#assertThreadBindingOwnership(current, threadBinding, threadId);
     if (status !== current.status && sortOrder === undefined) {
       const row = this.database.prepare(`
         SELECT MIN(sort_order) AS minimum
@@ -2246,6 +2248,7 @@ export class TaskboardDatabase {
   archiveTask(id, version, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    this.#assertThreadBindingOwnership(current, threadBinding, threadId);
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
@@ -2978,6 +2981,25 @@ export class TaskboardDatabase {
       throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${id}' does not exist`);
     }
     return comment;
+  }
+
+  #assertThreadBindingOwnership(current, threadBinding, threadId) {
+    const stored = current.threadBinding;
+    if (!stored?.codexHostId) return;
+    if (threadBinding === null) return;
+    if (threadBinding !== undefined) {
+      if (
+        threadBinding.codexHostId === stored.codexHostId
+        && threadBinding.threadId === stored.threadId
+      ) return;
+      throw new ApiError(409, "BINDING_CONFLICT", "Issue is bound to another Codex host", {
+        codexHostId: stored.codexHostId,
+      });
+    }
+    if (threadId === stored.threadId) return;
+    throw new ApiError(409, "BINDING_CONFLICT", "Issue is bound to another Codex host", {
+      codexHostId: stored.codexHostId,
+    });
   }
 
   #requireVersion(task, expectedVersion) {
