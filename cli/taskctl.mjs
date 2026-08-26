@@ -795,7 +795,7 @@ async function cloudLogin(api, rawUrl, actorName, overrides) {
       overrides.stderr ?? process.stderr,
     );
   if (typeof sharedKey !== "string" || !sharedKey) {
-    throw usageError("Cloud shared key cannot be empty");
+    throw usageError("Device credentials cannot be empty");
   }
   return api.request("PUT", "/api/local/cloud-session", {
     remoteUrl,
@@ -839,7 +839,7 @@ async function readSecretFromInput(input, output) {
         }
       }
     };
-    output.write("Shared key: ");
+    output.write("Device credentials (<deviceId>:<token>): ");
     input.setRawMode(true);
     input.setEncoding("utf8");
     input.resume();

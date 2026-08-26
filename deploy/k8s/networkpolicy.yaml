@@ -1,0 +1,42 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taskboard-ingress-lockdown
+spec:
+  podSelector:
+    matchLabels:
+      app: taskboard
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only pods carrying the board-traffic label (the ingress controller's namespace/pods)
+    # may reach the Taskboard port; same-namespace unlabeled pods are denied.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: __INGRESS_NAMESPACE__
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 47823
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taskboard-db-access
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: taskboard-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: taskboard
+      ports:
+        - protocol: TCP
+          port: 5432

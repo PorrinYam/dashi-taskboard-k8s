@@ -1,29 +1,54 @@
-# K8s shared board deployment (phase 1)
+# K8s shared board deployment (B版: PostgreSQL 多副本)
 
 Run the Taskboard server as a shared board on an existing Kubernetes cluster.
-Each Mac keeps its device-local companion and connects remotely with the same
-shared-password Basic Auth model described in
-[cloud-collaboration.md](./cloud-collaboration.md).
 
-Architecture in this phase:
+Architecture in this release:
 
-- one single-replica Deployment (SQLite + ReadWriteOnce PVC, no horizontal scaling);
-- `CODEX_TASKBOARD_SHARED_SECRET` gates every route except `/health` (HTTP and
-  WebSocket upgrades) and is injected from a K8s Secret, never committed;
-- `CODEX_TASKBOARD_TRUSTED_HOSTS` explicitly allowlists the board hostname for
-  the local-network host check — without it the public domain is rejected with
-  `INVALID_HOST`;
-- realtime: direct browsers use the existing SSE stream; companions bridge
-  their embedded browsers over WebSocket (`/api/events`) and the server
-  broadcasts `{"type":"revision",...}` frames.
+- **PostgreSQL storage** via [CloudNativePG](https://cloudnative-pg.io) (`Cluster` CR,
+  2 instances, RW service `taskboard-db-rw`). PostgreSQL is the single authoritative
+  store: issues, comments, activities, attachments bytes (`attachment_blobs`) and the
+  realtime event log all live there. SQLite remains only for the device-local
+  standalone mode (no `DATABASE_URL`).
+- **Stateless multi-replica** Taskboard Deployment: default `replicas: 2`,
+  `RollingUpdate` strategy (`maxUnavailable: 0`). Pods hold no persistent state; `/data`
+  is an emptyDir scratch used only by per-pod file paths that the remote board does not
+  rely on.
+- **Per-device credentials**: Basic auth is still the transport, but username is now a
+  device id and the password a per-device token stored (SHA-256 hash only) in the
+  `devices` table. Issuance, verification and revocation all go through the database;
+  revocation takes effect immediately on every replica. The legacy
+  `CODEX_TASKBOARD_SHARED_SECRET` env keeps its previous behaviour when set (its check
+  wins over device auth) so standalone container smoke-tests stay deterministic.
+- **Cross-replica realtime fanout** over PostgreSQL LISTEN/NOTIFY (no Redis): writers
+  append each change envelope into `taskboard_events` and NOTIFY its sequence number;
+  every replica tails the log by sequence and pushes SSE frames plus WebSocket
+  `{type:"revision",revision}` frames to its own clients. Delivery latency between
+  replicas is the round-trip of one NOTIFY (<5s by design).
+- **A档 hardening** shipped in the manifests: non-root user (uid 1000),
+  read-only root filesystem, RuntimeDefault seccomp, all capabilities dropped,
+  no privilege escalation, memory limits, NetworkPolicies for both the board pods and
+  the database, and scheduled VolumeSnapshot backups.
 
-Out of scope for phase 1: host scheduling, automatic issue flow, branch
-assignment.
+Out of scope (Goal 2): unattended scheduling, automatic issue flow, branch assignment.
+
+## 0. Cluster prerequisites
+
+* Kubernetes ≥ 1.25 with an ingress controller (nginx templates included).
+* The CloudNativePG operator. Check whether it is installed:
+
+  ```bash
+  kubectl get crd clusters.postgresql.cnpg.io
+  ```
+
+  If missing, install it from upstream before running `apply.sh`
+  (<https://cloudnative-pg.io/documentation/current/installation_upgrade/>);
+  `apply.sh` aborts with instructions when the CRD is absent.
+* HTTPS: an existing TLS Secret such as a wildcard certificate.
+* For backups: a CSI driver supporting volume snapshots and a `VolumeSnapshotClass`.
 
 ## 1. Build the image
 
-On any machine with Docker and this repository checked out (the phase-1
-commit on `feature/k8s-multi-host-phase1` or its merge):
+On any machine with Docker and this repository checked out:
 
 ```bash
 IMAGE=registry.example.com/org/dashi-taskboard:v1   # adjust
@@ -31,128 +56,178 @@ docker build -f deploy/Dockerfile -t "$IMAGE" .
 docker push "$IMAGE"
 ```
 
-Optional local smoke before pushing (verifies the exact container layout):
+Optional local smoke (standalone fallback path):
 
 ```bash
-docker run --rm -p 47823:47823 \
-  -e CODEX_TASKBOARD_SHARED_SECRET=local-smoke-key \
-  "$IMAGE" &
+docker run --rm -p 47823:47823 "$IMAGE" &
 sleep 3
-curl -s http://127.0.0.1:47823/health                      # {"status":"ok"}
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:47823/api/projects   # 401
-curl -s -o /dev/null -w "%{http_code}\n" -u any:local-smoke-key \
-  http://127.0.0.1:47823/api/projects                      # 200
+curl -s http://127.0.0.1:47823/health                       # {"status":"ok"}
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:47823/api/projects   # 401 vs devicemode? see §3
 kill %1
 ```
 
-## 2. Deploy to the cluster
+With neither `DATABASE_URL` nor shared secret set, the container serves open
+standalone SQLite — expected output is `200`, not `401`. To rehearse the exact
+container auth path locally add `-e CODEX_TASKBOARD_SHARED_SECRET=x` (then any Basic
+password works) or point `DATABASE_URL` at a reachable PostgreSQL and register a
+device (§3).
 
-Prerequisites: `kubectl` write access to the target namespace, an ingress
-controller, and (for HTTPS) an existing TLS Secret such as a wildcard
-certificate.
-
-Create the shared-key Secret first — the value must never enter Git. Paste the
-key at the hidden prompt:
+## 2. Deploy the base stack
 
 ```bash
 NAMESPACE=taskboard                                # adjust
-read -rs TASKBOARD_SHARED_KEY && export TASKBOARD_SHARED_KEY; echo
-kubectl -n "$NAMESPACE" create secret generic taskboard-shared-key \
-  --from-literal="sharedKey=$TASKBOARD_SHARED_KEY"
-unset TASKBOARD_SHARED_KEY
-```
-
-Apply the rendered manifests (create the namespace if it does not exist yet):
-
-```bash
 IMAGE=registry.example.com/org/dashi-taskboard:v1
 BOARD_HOST=taskboard.example.com                   # public HTTPS hostname
 INGRESS_CLASS=nginx                                # adjust to your controller
 TLS_SECRET=wildcard-tls                            # existing cert Secret name
-deploy/k8s/apply.sh                                # env vars as above
+deploy/k8s/apply.sh                                # env vars above
 ```
 
-`apply.sh` also accepts `NAMESPACE`, `STORAGE_SIZE` (default `5Gi`), and
-`TRUSTED_HOSTS` (default `$BOARD_HOST`; comma-separate extra hostnames).
+`apply.sh` additionally accepts:
 
-Verify (Done #1/#2 evidence) — one shot with the bundled script:
+| Variable            | Default          | Meaning                                            |
+|---------------------|------------------|----------------------------------------------------|
+| `REPLICAS`          | `2`              | Taskboard Deployment replicas                      |
+| `INGRESS_NAMESPACE` | `ingress-nginx`  | namespace whose ingress pods may reach port 47823  |
+| `SNAPSHOT_CLASS`    | *(unset)*        | enable backup CronJob; unset skips backups         |
+| `DB_PASSWORD`       | generated        | DB owner password for the created Secret           |
+
+It creates namespace/configmap/service, verifies the CNPG CRD, seeds the
+`taskboard-db-owner` Secret (never overwrites), applies the CNPG `Cluster`, waits for
+it to become Ready, applies both NetworkPolicies and the Deployment/RollingUpdate
+wave, waits for rollout, and finally installs the backup CronJob when
+`SNAPSHOT_CLASS` was provided.
+
+## 3. Device registration and revocation
+
+Device credentials are administered directly against the authoritative store, which
+works identically against a local development database and inside the cluster:
 
 ```bash
-BOARD_HOST=taskboard.example.com NAMESPACE=taskboard SHARED_KEY="$TASKBOARD_SHARED_KEY" \
+# issue (token printed ONCE; only its SHA-256 hash persists)
+kubectl -n taskboard exec deploy/taskboard -- \
+  node scripts/device-admin.mjs issue mac-a "Mac A"
+# {"device":{"id":"mac-a","name":"Mac A"},"token":"<TOKEN>"}
+
+kubectl -n taskboard exec deploy/taskboard -- node scripts/device-admin.mjs list
+
+# revoke — effective immediately on every replica
+kubectl -n taskboard exec deploy/taskboard -- \
+  node scripts/device-admin.mjs revoke mac-a
+```
+
+Every authenticated request then carries `Authorization: Basic base64(<deviceId>:<token>)`:
+
+* **Browsers** use the native Basic prompt (server answers `401` +
+  `WWW-Authenticate: Basic` on first visit): username = device id, password = token.
+* **The desktop App companion** stores the pair as one composite string in
+  `.data/cloud-companion.json` (mode 0600); `cloud-proxy` splits it when building the
+  Authorization header. Log a device in with:
+
+  ```bash
+  npm run taskctl -- cloud login --url https://taskboard.example.com --actor-name "Mac A"
+  # prompt now expects <deviceId>:<token> pasted as one line
+  ```
+
+  Boards still running the legacy shared-secret model keep working: without a `:` in
+  the secret the proxy sends the configured actor name and the secret unchanged.
+* **taskctl / curl** against the remote board always flow through the same companion.
+
+Revocation returns `401 UNAUTHORIZED` instantly for that device while other devices
+are unaffected (three-state evidence recipe lives in `verify.sh` + §6 below).
+
+## 4. Cutover from a phase-1 SQLite board
+
+Prerequisites: the phase-1 Deployment (`SQLite + taskboard-data PVC`) is deployed and
+the B版 image is pushed.
+
+1. Deploy everything except traffic switch: `deploy/k8s/apply.sh` (§2). The Job
+   template below mounts the **old** `taskboard-data` PVC read-only.
+2. Freeze writes on the phase-1 board (announce the cut-over window).
+3. Run the one-shot importer — it copies the source (plus `-wal/-shm` and the
+   `attachments/` directory) into a scratch dir, runs every historical schema
+   migration against the copy, imports rows with `ON CONFLICT DO NOTHING`, moves
+   attachment files into `attachment_blobs`, reconciles the change-revision counter
+   and prints a source/target comparison table. Any row-count mismatch exits non-zero
+   — do not proceed unless every line reads `yes`:
+
+   ```bash
+   kubectl -n taskboard create job --from=job/taskboard-migrate taskboard-migrate-1
+   kubectl -n taskboard wait --for=condition=complete job/taskboard-migrate-1 --timeout=3600s
+   kubectl -n taskboard logs job/taskboard-migrate-1
+   ```
+
+   Re-running the Job is safe: second pass reports identical counts and imports zero
+   additional rows (forward-replayable + idempotent).
+4. Point traffic at the new board: the new Deployment already owns the
+   `taskboard` Service selector, so simply delete/repurpose the phase-1 Deployment:
+
+   ```bash
+   kubectl -n taskboard scale deploy/taskboard-old --replicas=0   # if you kept it alongside
+   ```
+
+5. Register real devices (§3) and hand out `<deviceId>:<token>` composites.
+6. After a verified soak period the legacy PVC can be retained as cold backup or
+   deleted (`kubectl -n taskboard delete pvc taskboard-data`).
+
+## 5. Verify the deployment
+
+```bash
+BOARD_HOST=taskboard.example.com NAMESPACE=taskboard \
+DEVICE_ID=<id> DEVICE_TOKEN=<token> VERIFY_ISSUE_ID=<active task id> \
   deploy/k8s/verify.sh
 ```
 
-It prints the pod status, the 401 (no auth) and 200 (Basic auth) status codes
-for `/api/projects`, the public `/health` check, and a live SSE probe that
-must show a `: connected` line within seconds (this catches ingress response
-buffering — the ingress template ships the nginx `proxy-buffering: "off"`
-annotation for exactly that reason; adjust it if you use another controller).
+It checks: replica list; anonymous request rejected with `401`; device credentials
+accepted (`200`); public `/health` (`200`); cross-replica realtime — a WebSocket held
+on one replica receives `{type:"revision"}` within seconds of an issue move hitting
+the *other* replica (both directions); resilience — killing one pod mid-flight and
+completing an issue move on the survivor, followed by a return to two Ready replicas.
 
-Controller notes: the nginx ingress proxies WebSocket upgrades natively. For
-other controllers add the required Upgrade annotations to
-`deploy/k8s/ingress.yaml` before applying.
+## 6. Live-board browser check
 
-## 3. Connect a Mac
+Open `https://taskboard.example.com` twice (two devices, e.g. two Macs), authenticating
+each with its own device id/token through the native Basic prompt. Create an issue in
+window A; the card appears in window B without refresh; during
+`kubectl -n taskboard rollout restart deployment/taskboard` pages automatically
+reconnect their SSE/WebSocket channels and resume live updates once the replica is
+back (RollingUpdate keeps ≥1 replica serving at all times).
 
-On each Mac (both Mac A and Mac B), from this repository checkout:
+## 7. Backups — choice recorded
 
-```bash
-npm ci
-CODEX_TASKBOARD_HOST=127.0.0.1 npm start        # device-local companion
-```
+**Chosen: VolumeSnapshot CronJob** (`backup-cronjob.yaml`, daily 03:17,
+concurrency-safe, RBAC-scoped to snapshot objects).
 
-In a second terminal, log the device in with its own actor name and the shared
-key at the hidden `Shared key:` prompt:
+Reasoning: the scope offered either CSI snapshots of the data volume or a Litestream
+sidecar. Litestream replicates *SQLite* WAL files — it targets exactly the single-node
+storage this release replaces, so a sidecar would be dead weight inside a PostgreSQL
+deployment. CloudNativePG's primary volume is continuously WAL-written; a CSI snapshot
+taken while PostgreSQL runs stays crash-consistent and recovers via standard WAL
+replay. Requires a `VolumeSnapshotClass`; retention/pruning of old snapshots follows
+your cluster's policy tooling (e.g. Kyverno TTL rules).
 
-```bash
-npm run taskctl -- cloud login \
-  --url https://taskboard.example.com \
-  --actor-name "mac-a"                          # use "mac-b" on the other Mac
-npm run taskctl -- cloud status                 # mode: cloud
-npm run taskctl -- project list                 # proxied through the companion
-```
+## 8. A档 hardening inventory
 
-Credentials persist in `.data/cloud-companion.json` (mode 0600) on that Mac
-only; `cloud logout` returns it to standalone local mode.
+| Control | Manifest location |
+|---|---|
+| `runAsNonRoot: true`, fixed uid/gid 1000, fsGroup | deployment.yaml pod securityContext |
+| `readOnlyRootFilesystem: true` | deployment.yaml container securityContext |
+| `seccompProfile: RuntimeDefault` | pod securityContext |
+| `allowPrivilegeEscalation: false` | container securityContext |
+| `capabilities: drop ALL` | container securityContext |
+| Resource requests + memory limits | deployment.yaml / migration-job.yaml / backup-cronjob.yaml |
+| Ingress lockdown: unlabeled same-ns pods cannot reach 47823 | networkpolicy.yaml |
+| Database reachable only by `app=taskboard` pods | networkpolicy.yaml (second rule) |
+| Non-root + read-only rootfs also for migration Job & backup jobs | respective manifests |
 
-Phase-1 verification recipes:
+Writable space for the few file paths the server touches (client-storage KV, jira
+config) comes from the `/data` emptyDir — contents are pod-local and disappear with
+the pod, which is safe because the authoritative state is PostgreSQL.
 
-- **Live board (Done #4)** — open `https://taskboard.example.com` in a browser
-  on Mac A (username: any display name, password: the shared key). On Mac B
-  run `npm run taskctl -- issue create --project local --title "live check"`.
-  The new card appears on Mac A without a refresh.
-- **Distinct host identities (Done #5)** — each Mac claims a different issue:
+## 9. Known limitations
 
-  ```bash
-  CODEX_THREAD_ID=thread-a npm run taskctl -- issue move LOCAL-1 \
-    --status in_progress --if-version 1 \
-    --binding-thread-id thread-a --binding-codex-project-id demo \
-    --binding-codex-project-kind remote --binding-codex-host-id mac-a \
-    --binding-workspace-path /Users/a/work/demo
-  ```
-
-  then `issue get <ID> --json` on both issues shows different
-  `threadBinding.codexHostId` values (`mac-a` / `mac-b`).
-- **No takeover (Done #6)** — on Mac B, move the issue Mac A claimed (no
-  `--if-version`, no binding flags): taskctl exits with code 5 and prints
-  `{"error":{"code":"BINDING_CONFLICT",...,"details":{"codexHostId":"mac-a"}}}`;
-  `issue get` still shows Mac A's binding.
-
-## 4. Rotate the shared key
-
-Generate a new key and replace the Secret without a delete/recreate gap:
-
-```bash
-read -rs NEW_KEY && export NEW_KEY; echo
-kubectl -n "$NAMESPACE" create secret generic taskboard-shared-key \
-  --from-literal="sharedKey=$NEW_KEY" \
-  --dry-run=client -o yaml | kubectl apply -f -
-unset NEW_KEY
-kubectl -n "$NAMESPACE" rollout restart deployment/taskboard
-kubectl -n "$NAMESPACE" rollout status deployment/taskboard
-```
-
-After rotation both Macs rerun `taskctl cloud login` with the new key.
-Browsers cache Basic credentials, so close the authenticated session (or clear
-site data) and re-authenticate. Rotation affects both Macs at once; there is
-no per-host revocation in the shared-password model.
+* Per-pod paths on `/data` are ephemeral (documented consequence of stateless pods).
+* `LOCAL_COMPANION_ROUTES` behaviour is unchanged from phase 1: those routes never
+  proxy and stay device-local.
+* Revoked credentials receive `401` with no grace period; clients must re-login with
+  newly issued credentials.

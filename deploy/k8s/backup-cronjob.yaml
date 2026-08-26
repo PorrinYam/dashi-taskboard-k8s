@@ -1,0 +1,94 @@
+# Scheduled crash-consistent backups of the PostgreSQL primary's data volume.
+# Choice rationale (docs/k8s-deployment.md §7): Litestream targets SQLite and therefore
+# only fits the legacy single-node volume; with CloudNativePG a CSI VolumeSnapshot of
+# the primary PVC is WAL-safe and needs no extra sidecar in the board pods.
+# Requires: a CSI driver with snapshot support and class __SNAPSHOT_CLASS__.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: taskboard-backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: taskboard-backup
+rules:
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: taskboard-backup
+subjects:
+  - kind: ServiceAccount
+    name: taskboard-backup
+roleRef:
+  kind: Role
+  name: taskboard-backup
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: taskboard-backup
+spec:
+  # 03:17 daily, deliberately off the hour to avoid cluster-wide cron storms.
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: taskboard-backup
+        spec:
+          serviceAccountName: taskboard-backup
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: snapshot
+              image: bitnami/kubectl:1.31
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  STAMP=$(date +%Y%m%d-%H%M%S)
+                  POD=$(kubectl get pod -l cnpg.io/cluster=taskboard-db,role=primary -o jsonpath='{.items[0].metadata.name}')
+                  PVC=$(kubectl get pod "$POD" -o jsonpath='{.spec.volumes[?(@.name=="pgdata")].persistentVolumeClaim.claimName}')
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: snapshot.storage.k8s.io/v1
+                  kind: VolumeSnapshot
+                  metadata:
+                    name: taskboard-db-${STAMP}
+                  spec:
+                    volumeSnapshotClassName: __SNAPSHOT_CLASS__
+                    source:
+                      persistentVolumeClaimName: ${PVC}
+                  EOF
+                  kubectl wait --for=ready volumesnapshot/taskboard-db-${STAMP} --timeout=300s
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 128Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL

@@ -27,7 +27,13 @@ export function isLocalCompanionRoute(pathname) {
 }
 
 function basicAuthorization(actorName, sharedKey) {
-  return `Basic ${Buffer.from(`${actorName}:${sharedKey}`, "utf8").toString("base64")}`;
+  // Device credentials travel as a single secret string "deviceId:token" (the same shape
+  // issued by scripts/device-admin.mjs); boards still running the legacy shared-key model
+  // accept any username, so fall back to the configured actor name when no separator exists.
+  const separator = sharedKey.indexOf(":");
+  const username = separator === -1 ? actorName : sharedKey.slice(0, separator);
+  const password = separator === -1 ? sharedKey : sharedKey.slice(separator + 1);
+  return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
 async function prepareRequest(request, {
