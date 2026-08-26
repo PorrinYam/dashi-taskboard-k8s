@@ -3507,7 +3507,12 @@ export function createTaskboardServer(options = {}) {
       if (fd !== null && (!Number.isInteger(fd) || fd < 3 || fd > 255)) {
         throw new Error("Taskboard server listen fd must be an inherited file descriptor");
       }
-      if (pgEventBus) await pgEventBus.start();
+      if (pgEventBus) {
+        // Replica-safe startup sweep: interrupt running turns owned by this instance
+        // (plus NULL rows left by the migration importer) before accepting traffic.
+        await database.interruptAbandonedAiChatRuns({ runnerHost: database.runnerHost });
+        await pgEventBus.start();
+      }
       await new Promise((resolve, reject) => {
         const onError = (error) => {
           server.off("listening", onListening);

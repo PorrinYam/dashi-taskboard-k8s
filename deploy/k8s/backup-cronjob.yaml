@@ -79,7 +79,8 @@ spec:
                     source:
                       persistentVolumeClaimName: ${PVC}
                   EOF
-                  kubectl wait --for=ready volumesnapshot/taskboard-db-${STAMP} --timeout=300s
+                  kubectl wait --for=jsonpath='{.status.readyToUse}'=true \
+                    volumesnapshot/taskboard-db-${STAMP} --timeout=300s
               resources:
                 requests:
                   cpu: 50m

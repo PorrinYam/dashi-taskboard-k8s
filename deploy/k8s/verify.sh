@@ -8,28 +8,15 @@ set -eu
 
 BOARD_HOST=${BOARD_HOST:?BOARD_HOST is required}
 NAMESPACE=${NAMESPACE:-taskboard}
-DEVICE_ID=${DEVICE_ID:?DEVICE_ID is required - register one via scripts/device-admin.mjs}
-DEVICE_TOKEN=${DEVICE_TOKEN:?DEVICE_TOKEN is required - that device token}
-VERIFY_ISSUE_ID=${VERIFY_ISSUE_ID:?VERIFY_ISSUE_ID is required - an active task id}
+DEVICE_ID=${DEVICE_ID:?DEVICE_ID is required (a device registered via scripts/device-admin.mjs)}
+DEVICE_TOKEN=${DEVICE_TOKEN:?DEVICE_TOKEN is required (the token issued for that device)}
+VERIFY_ISSUE_ID=${VERIFY_ISSUE_ID:?VERIFY_ISSUE_ID is required (an active task id, e.g. LOCAL-1)}
 
 BOARD=${BOARD_SCHEME:-https}://$BOARD_HOST
 AUTH="$DEVICE_ID:$DEVICE_TOKEN"
 
 field() { # field <jsonField> : crude positive-path extractor, good enough for probes
   grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2 | tr -d '"'
-}
-
-probe_ip() { # probe_ip <podIp> <path> [curl args...] — curl against one replica in-cluster
-  ip=$1; path=$2; shift 2
-  kubectl -n "$NAMESPACE" run "verify-probe-$(date +%s%N)" --rm -i --quiet \
-    --image=curlimages/curl:8.10.1 --restart=Never --command -- \
-    curl -s -u "$AUTH" "$@" "http://$ip:47823$path"
-}
-
-api_get() { probe_ip "$1" "$2"; }
-
-flip_status() {
-  case "$1" in todo) echo backlog ;; *) echo todo ;; esac
 }
 
 ready_pods() {
@@ -45,15 +32,53 @@ wait_two_ready() {
   done
 }
 
+# Board-to-board requests must originate from a taskboard pod: the ingress NetworkPolicy
+# admits only the ingress controller plus taskboard peers, so every direct-to-pod probe
+# below is executed inside one of the board pods (image ships node, no curl needed).
+board_http() { # board_http <srcPod> <method> <targetPodIp> <pathWithQuery> [jsonBody]
+              # Sets REPLY_CODE (first line) and REPLY_BODY (rest).
+  local output
+  output=$(kubectl -n "$NAMESPACE" exec "$1" -- node --input-type=module -e '
+    const [method, url, auth, body] = process.argv.slice(2);
+    const headers = {};
+    if (auth) headers.authorization = "Basic " + Buffer.from(auth).toString("base64");
+    if (body) headers["content-type"] = "application/json";
+    const response = await fetch(url, { method, headers, body: body || undefined });
+    console.log(response.status);
+    process.stdout.write(await response.text());
+  ' -- "$2" "http://$3:47823$4" "$AUTH" "${5:-}")
+  REPLY_CODE=$(printf '%s' "$output" | sed -n '1p')
+  REPLY_BODY=$(printf '%s' "$output" | tail -n +2)
+}
+
+task_json_on() { # task_json_on <srcPod> <targetIp> : authenticated GET of the verify issue
+  board_http "$1" GET "$2" "/api/tasks/$VERIFY_ISSUE_ID"
+  printf '%s\n' "$REPLY_BODY"
+}
+
+flip_status() {
+  case "$1" in todo) echo backlog ;; *) echo todo ;; esac
+}
+
+move_and_flip_via() { # move_and_flip_via <srcPod> <writerIp> : flips the issue status through
+                      # the writer replica with the request originating inside srcPod.
+  task=$(task_json_on "$1" "$2")
+  version=$(printf '%s' "$task" | field version)
+  current=$(printf '%s' "$task" | field status)
+  target=$(flip_status "${current:-todo}")
+  board_http "$1" POST "$2" "/api/tasks/$VERIFY_ISSUE_ID/move" \
+    "{\"version\":$version,\"status\":\"$target\"}" >/dev/null
+}
+
 echo "== [1] pods =="
 kubectl -n "$NAMESPACE" get pods -l app=taskboard
 
-echo "== [2] /api/projects without Authorization (expect 401) =="
+echo "== [2] /api/projects without Authorization via public host (expect 401) =="
 UNAUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BOARD/api/projects")
 echo "$UNAUTH_CODE"
 if [ "$UNAUTH_CODE" != "401" ]; then echo "FAIL: expected 401 without credentials" >&2; exit 1; fi
 
-echo "== [3] /api/projects with device credentials (expect 200) =="
+echo "== [3] /api/projects with device credentials via public host (expect 200) =="
 AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "$AUTH" "$BOARD/api/projects")
 echo "$AUTH_CODE"
 if [ "$AUTH_CODE" != "200" ]; then echo "FAIL: device auth rejected" >&2; exit 1; fi
@@ -63,23 +88,13 @@ HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BOARD/health")
 echo "$HEALTH_CODE"
 if [ "$HEALTH_CODE" != "200" ]; then echo "FAIL: health check failed" >&2; exit 1; fi
 
-echo "== [5] cross-replica realtime revision frames (<5s each) =="
+echo "== [5] cross-replica realtime revision frames (<45s each) =="
 wait_two_ready
 POD_ROWS=$(ready_pods)
 POD_A=$(echo "$POD_ROWS" | sed -n '1p' | cut -d' ' -f1)
 IP_A=$(echo "$POD_ROWS" | sed -n '1p' | cut -d' ' -f2)
 POD_B=$(echo "$POD_ROWS" | sed -n '2p' | cut -d' ' -f1)
 IP_B=$(echo "$POD_ROWS" | sed -n '2p' | cut -d' ' -f2)
-
-move_issue_via() { # move_issue_via <podIp> <targetStatus>
-  task_json=$(api_get "$1" "/api/tasks/$VERIFY_ISSUE_ID")
-  version=$(echo "$task_json" | field version)
-  current=$(echo "$task_json" | field status)
-  target=$2
-  probe_ip "$1" "/api/tasks/$VERIFY_ISSUE_ID/move" \
-    -X POST -H 'content-type: application/json' \
-    -d "{\"version\":$version,\"status\":\"$target\"}" >/dev/null
-}
 
 wait_for_ws_revision() { # wait_for_ws_revision <podName> <connectIp>: hold a WS on that replica's
                          # own /api/events and exit 0 when a revision frame arrives.
@@ -119,8 +134,7 @@ check_frame_latency() { # check_frame_latency <listenerPod> <listenerIp> <writer
   wait_for_ws_revision "$listener_pod" "$listener_ip" &
   ws_pid=$!
   sleep 3 # let the websocket settle
-  current=$(api_get "$writer_ip" "/api/tasks/$VERIFY_ISSUE_ID" | field status)
-  move_issue_via "$writer_ip" "$(flip_status "${current:-todo}")"
+  move_and_flip_via "$listener_pod" "$writer_ip"
   wait $ws_pid
 }
 
@@ -130,21 +144,35 @@ echo "-- listener $POD_B ($IP_B), writer replica $IP_A:"
 check_frame_latency "$POD_B" "$IP_B" "$IP_A"
 
 echo "== [6] issue move completes on surviving replica while the other is killed =="
-before_version=$(api_get "$IP_B" "/api/tasks/$VERIFY_ISSUE_ID" | field version)
-current=$(api_get "$IP_B" "/api/tasks/$VERIFY_ISSUE_ID" | field status)
+before_json=$(task_json_on "$POD_B" "$IP_B")
+before_version=$(printf '%s' "$before_json" | field version)
+current=$(printf '%s' "$before_json" | field status)
 kubectl -n "$NAMESPACE" delete pod "$POD_A" --wait=false >/dev/null
 sleep 2 # pod enters Terminating; replica B must keep serving during the drain
-move_issue_via "$IP_B" "$(flip_status "${current:-todo}")"
-after_json=$(api_get "$IP_B" "/api/tasks/$VERIFY_ISSUE_ID")
-after_version=$(echo "$after_json" | field version)
-after_status=$(echo "$after_json" | field status)
+move_and_flip_via "$POD_B" "$IP_B"
+after_json=$(task_json_on "$POD_B" "$IP_B")
+after_version=$(printf '%s' "$after_json" | field version)
+after_status=$(printf '%s' "$after_json" | field status)
 if ! [ "${after_version:-0}" -gt "${before_version:-9999999}" ]; then
   echo "FAIL: issue move did not stick on the surviving replica (v$before_version -> v${after_version:-none})" >&2
   exit 1
 fi
 echo "ok: moved to '$after_status' at v$after_version on $POD_B while $POD_A was going away"
 
-echo "== [7] cluster returns to two Ready replicas =="
+echo "== [7] unlabeled same-namespace pod is denied port 47823 (NetworkPolicy lockdown) =="
+blocked_probe() {
+  kubectl -n "$NAMESPACE" run "verify-blocked-$(date +%s%N)" --rm -i --quiet \
+    --image=curlimages/curl:8.10.1 --restart=Never --command -- \
+    curl -s -o /dev/null -m 8 -w '%{http_code}' "http://$IP_B:47823/health"
+}
+BLOCKED_CODE=$(blocked_probe || true)
+if [ -n "$BLOCKED_CODE" ] && [ "$BLOCKED_CODE" != "000" ]; then
+  echo "FAIL: unlabeled pod reached the board (HTTP $BLOCKED_CODE) — NetworkPolicy not enforcing" >&2
+  exit 1
+fi
+echo "ok: unlabeled pod got no response (${BLOCKED_CODE:-no reply})"
+
+echo "== [8] cluster returns to two Ready replicas =="
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod -l app=taskboard --timeout=300s >/dev/null
 ready_pods
 

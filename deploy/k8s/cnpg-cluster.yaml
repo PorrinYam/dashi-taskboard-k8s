@@ -1,6 +1,6 @@
 # PostgreSQL cluster owned by CloudNativePG (https://cloudnative-pg.io).
-# CNPG generates a <cluster>-superuser Secret holding the connection password; the
-# Deployment assembles DATABASE_URL from it (see deployment.yaml).
+# The taskboard-db-owner Secret (created by apply.sh, basic-auth shape with username=taskboard)
+# seeds the application role; the Deployment assembles DATABASE_URL from it.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:

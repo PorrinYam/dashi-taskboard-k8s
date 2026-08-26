@@ -106,7 +106,13 @@ try {
     const sourceCount = Number(
       source.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n,
     );
-    const columns = await targetColumns(table, options);
+    // Import only columns that exist on BOTH sides; PG-only columns (e.g. the ai_chat_runs
+    // runner_host ownership stamp added after the phase-1 schema) import as NULL.
+    const sourceColumns = new Set(
+      source.prepare(`PRAGMA table_info("${table}")`).all().map((column) => column.name),
+    );
+    const columns = (await targetColumns(table, options))
+      .filter((column) => sourceColumns.has(column));
     const quotedColumns = columns.map((column) => `"${column}"`).join(", ");
     const placeholders = columns.map((_, index) => `$${index + 1}`).join(", ");
     const conflictClause = `ON CONFLICT (${conflictKeys.map((key) => `"${key}"`).join(", ")}) DO NOTHING`;
@@ -133,9 +139,16 @@ try {
   }
 
   // Attachment bytes: filesystem payloads beside the SQLite file move into attachment_blobs.
+  // Covers both task/comment attachments and project README attachments.
   let blobTargetCount = 0;
   if (existsSync(attachmentsDirectory)) {
-    const meta = source.prepare("SELECT id FROM attachments ORDER BY created_at, id");
+    const meta = source.prepare(`
+      SELECT id FROM (
+        SELECT id FROM attachments
+        UNION
+        SELECT id FROM project_readme_attachments
+      ) ORDER BY id
+    `);
     for (const row of meta.iterate()) {
       const file = path.join(attachmentsDirectory, row.id);
       if (!existsSync(file)) continue;

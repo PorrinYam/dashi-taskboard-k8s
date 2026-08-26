@@ -93,9 +93,10 @@ deploy/k8s/apply.sh                                # env vars above
 | `DB_PASSWORD`       | generated        | DB owner password for the created Secret           |
 
 It creates namespace/configmap/service, verifies the CNPG CRD, seeds the
-`taskboard-db-owner` Secret (never overwrites), applies the CNPG `Cluster`, waits for
-it to become Ready, applies both NetworkPolicies and the Deployment/RollingUpdate
-wave, waits for rollout, and finally installs the backup CronJob when
+`taskboard-db-owner` Secret (basic-auth shaped with `username=taskboard`; never
+overwrites), applies the CNPG `Cluster`, waits for it to become Ready, applies both
+NetworkPolicies and the Deployment/RollingUpdate wave plus the suspended migration
+CronJob, waits for rollout, and finally installs the backup CronJob when
 `SNAPSHOT_CLASS` was provided.
 
 ## 3. Device registration and revocation
@@ -141,23 +142,27 @@ are unaffected (three-state evidence recipe lives in `verify.sh` + §6 below).
 Prerequisites: the phase-1 Deployment (`SQLite + taskboard-data PVC`) is deployed and
 the B版 image is pushed.
 
-1. Deploy everything except traffic switch: `deploy/k8s/apply.sh` (§2). The Job
-   template below mounts the **old** `taskboard-data` PVC read-only.
+1. Deploy everything except traffic switch: `deploy/k8s/apply.sh` (§2). The suspended
+   migration CronJob installed by it mounts the **old** `taskboard-data` PVC read-only.
 2. Freeze writes on the phase-1 board (announce the cut-over window).
 3. Run the one-shot importer — it copies the source (plus `-wal/-shm` and the
    `attachments/` directory) into a scratch dir, runs every historical schema
    migration against the copy, imports rows with `ON CONFLICT DO NOTHING`, moves
-   attachment files into `attachment_blobs`, reconciles the change-revision counter
-   and prints a source/target comparison table. Any row-count mismatch exits non-zero
-   — do not proceed unless every line reads `yes`:
+   attachment files (task/comment *and* README attachments) into `attachment_blobs`,
+   reconciles the change-revision counter and prints a source/target comparison table.
+   Any row-count mismatch exits non-zero — do not proceed unless every line reads
+   `yes`:
 
    ```bash
-   kubectl -n taskboard create job --from=job/taskboard-migrate taskboard-migrate-1
-   kubectl -n taskboard wait --for=condition=complete job/taskboard-migrate-1 --timeout=3600s
-   kubectl -n taskboard logs job/taskboard-migrate-1
+   kubectl -n taskboard create job --from=cronjob/taskboard-migrate \
+     taskboard-migrate-$(date +%s)
+   kubectl -n taskboard wait \
+     --for=condition=complete job/taskboard-migrate-<id> --timeout=3600s
+   kubectl -n taskboard logs job/taskboard-migrate-<id>
    ```
 
-   Re-running the Job is safe: second pass reports identical counts and imports zero
+   Re-running is safe: instantiate a fresh Job each time (the unique name avoids the
+   completed-Job name collision); every pass reports identical counts and imports zero
    additional rows (forward-replayable + idempotent).
 4. Point traffic at the new board: the new Deployment already owns the
    `taskboard` Service selector, so simply delete/repurpose the phase-1 Deployment:
@@ -182,7 +187,10 @@ It checks: replica list; anonymous request rejected with `401`; device credentia
 accepted (`200`); public `/health` (`200`); cross-replica realtime — a WebSocket held
 on one replica receives `{type:"revision"}` within seconds of an issue move hitting
 the *other* replica (both directions); resilience — killing one pod mid-flight and
-completing an issue move on the survivor, followed by a return to two Ready replicas.
+completing an issue move on the survivor; hardening evidence — an unlabeled
+same-namespace pod cannot reach port 47823; and a return to two Ready replicas.
+All direct-to-pod probes execute inside taskboard pods because the ingress lockdown
+admits only ingress-controller and `app=taskboard` peers.
 
 ## 6. Live-board browser check
 
@@ -215,7 +223,7 @@ your cluster's policy tooling (e.g. Kyverno TTL rules).
 | `seccompProfile: RuntimeDefault` | pod securityContext |
 | `allowPrivilegeEscalation: false` | container securityContext |
 | `capabilities: drop ALL` | container securityContext |
-| Resource requests + memory limits | deployment.yaml / migration-job.yaml / backup-cronjob.yaml |
+| Resource requests + memory limits | deployment.yaml / migration-cronjob.yaml / backup-cronjob.yaml |
 | Ingress lockdown: unlabeled same-ns pods cannot reach 47823 | networkpolicy.yaml |
 | Database reachable only by `app=taskboard` pods | networkpolicy.yaml (second rule) |
 | Non-root + read-only rootfs also for migration Job & backup jobs | respective manifests |
@@ -231,3 +239,11 @@ the pod, which is safe because the authoritative state is PostgreSQL.
   proxy and stay device-local.
 * Revoked credentials receive `401` with no grace period; clients must re-login with
   newly issued credentials.
+* Cross-replica event fanout is at-least-once with a theoretical out-of-order window:
+  PostgreSQL assigns `taskboard_events` sequence numbers at INSERT while commits can
+  interleave, so a tailing replica may observe seq 5 before 4 and skip 4 until the next
+  event (or the 2s catch-up poll / client reconnect, which full-refetch) heals it.
+  Human-pace edits make this unobservable in practice.
+* Interrupted AI-chat runs: startup cleanup only touches runs owned by the restarting
+  instance (`runner_host`) plus NULL rows imported from SQLite. A pod removed by scale-down
+  leaves its run `running` until any other intervention — terminate via the UI instead.

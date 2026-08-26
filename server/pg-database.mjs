@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import os from "node:os";
 import pg from "pg";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
@@ -210,7 +211,10 @@ CREATE TABLE IF NOT EXISTS ai_chat_runs (
   exit_code INTEGER,
   error TEXT,
   started_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  -- Server instance (pod) that owns a running turn; startup cleanup only interrupts
+  -- its own leftovers plus NULL rows left by the SQLite migration importer.
+  runner_host TEXT
 );
 
 CREATE INDEX IF NOT EXISTS ai_chat_runs_thread_started
@@ -286,6 +290,8 @@ export class PgTaskboardDatabase {
     this.pool = new pg.Pool({ connectionString: databaseUrl, max: 10 });
     this.readyPromise = null;
     this.closed = false;
+    // Identity of this server instance for run ownership; in Kubernetes this is the pod name.
+    this.runnerHost = process.env.HOSTNAME || os.hostname();
     // Uniform attachment-bytes surface consumed by server/app.mjs for both backends.
     this.blobs = {
       put: async (id, body) => {
@@ -1038,8 +1044,8 @@ export class PgTaskboardDatabase {
     await this.#tx(async (db) => {
       await db.run(`
         INSERT INTO ai_chat_runs (
-          id, thread_id, status, exit_code, error, started_at, finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          id, thread_id, status, exit_code, error, started_at, finished_at, runner_host
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `,
         id,
         input.threadId,
@@ -1048,6 +1054,7 @@ export class PgTaskboardDatabase {
         input.error ?? null,
         timestamp,
         input.finishedAt ?? null,
+        input.runnerHost ?? null,
       );
       if ((input.status ?? "running") === "running") {
         await db.run(`
@@ -1135,17 +1142,22 @@ export class PgTaskboardDatabase {
     `, threadId).then((rows) => rows.map(aiChatEventFromRow)));
   }
 
-  async interruptAbandonedAiChatRuns() {
+  async interruptAbandonedAiChatRuns({ runnerHost } = {}) {
     return this.#tx(async (db) => {
       const timestamp = NOW();
+      // Scoped mode (replica startup): only this instance's leftovers, plus NULL rows the
+      // migration importer brought over — never another live replica's running turns.
+      const ownershipFilter = runnerHost === undefined
+        ? ""
+        : " AND (runner_host IS NULL OR runner_host = ?)";
       const result = await db.run(`
         UPDATE ai_chat_runs
         SET
           status = 'interrupted',
           error = COALESCE(error, 'Taskboard service restarted'),
           finished_at = COALESCE(finished_at, ?)
-        WHERE status = 'running'
-      `, timestamp);
+        WHERE status = 'running'${ownershipFilter}
+      `, ...(runnerHost === undefined ? [timestamp] : [timestamp, runnerHost]));
       if (result.changes > 0) {
         await db.run(`
           UPDATE ai_chat_threads
@@ -1504,7 +1516,7 @@ export class PgTaskboardDatabase {
         UPDATE tasks SET ${assignments.join(", ")} WHERE id = ? AND version = ?
       `, ...values);
       if (updateResult.changes !== 1) {
-        this.#throwMissingOrConflict(id, version);
+        await this.#throwMissingOrConflict(id, version);
       }
       if (projectChanged) {
         await db.run(`
@@ -1565,7 +1577,7 @@ export class PgTaskboardDatabase {
         WHERE id = ? AND version = ?
       `, status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
-        this.#throwMissingOrConflict(id, version);
+        await this.#throwMissingOrConflict(id, version);
       }
       await this.#recordTaskActivity(
         current.id,
@@ -1596,7 +1608,7 @@ export class PgTaskboardDatabase {
         WHERE id = ? AND version = ?
       `, timestamp, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
-        this.#throwMissingOrConflict(id, version);
+        await this.#throwMissingOrConflict(id, version);
       }
       await this.#recordTaskActivity(
         current.id,
@@ -1629,7 +1641,7 @@ export class PgTaskboardDatabase {
         WHERE id = ? AND version = ?
       `, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
-        this.#throwMissingOrConflict(id, version);
+        await this.#throwMissingOrConflict(id, version);
       }
       await this.#recordTaskActivity(
         current.id,
@@ -1660,7 +1672,7 @@ export class PgTaskboardDatabase {
         current.id,
         version,
       );
-      if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
+      if (result.changes !== 1) await this.#throwMissingOrConflict(id, version);
       return { task: current, attachmentIds };
     });
   }
@@ -1908,7 +1920,7 @@ export class PgTaskboardDatabase {
         WHERE id = ? AND version = ?
       `, body, ...(storedBinding ?? []), NOW(), changeRevision, id, version);
       if (result.changes !== 1) {
-        this.#throwMissingCommentOrConflict(id, version);
+        await this.#throwMissingCommentOrConflict(id, version);
       }
       return null;
     });
@@ -1923,7 +1935,7 @@ export class PgTaskboardDatabase {
         DELETE FROM comments WHERE id = ? AND version = ?
       `, id, version);
       if (deleteResult.changes !== 1) {
-        this.#throwMissingCommentOrConflict(id, version);
+        await this.#throwMissingCommentOrConflict(id, version);
       }
       return current;
     });
@@ -2025,6 +2037,10 @@ export class PgTaskboardDatabase {
   // ---- device credentials ----
 
   async createDevice({ id, name }) {
+    if (!id || id.includes(":") || !name) {
+      // ':' would corrupt the "deviceId:token" composite string carried by companions.
+      throw new ApiError(400, "INVALID_DEVICE_ID", "Device id must not contain ':' and requires a name");
+    }
     await this.#ready();
     const token = randomBytes(32).toString("base64url");
     try {
@@ -2354,7 +2370,7 @@ export class PgTaskboardDatabase {
       WHERE id = ? AND version = ?
     `, ...(storedBinding ?? []), timestamp, id, version);
     if (result.changes !== 1) {
-      this.#throwMissingOrConflict(id, version);
+      await this.#throwMissingOrConflict(id, version);
     }
   }
 
@@ -2373,11 +2389,12 @@ export class PgTaskboardDatabase {
   }
 
   async #requireComment(id, db = this.#root()) {
-    const comment = await db.get("SELECT * FROM comments WHERE id = ?", id);
-    if (!comment) {
+    const row = await db.get("SELECT * FROM comments WHERE id = ?", id);
+    if (!row) {
       throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${id}' does not exist`);
     }
-    return comment;
+    // Mirrors the SQLite contract: callers receive the mapped comment incl. attachments.
+    return this.#commentWithAttachments(row, db);
   }
 
   #assertThreadBindingOwnership(current, threadBinding, threadId) {

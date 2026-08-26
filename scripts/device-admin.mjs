@@ -20,6 +20,8 @@ if (!databaseUrl) {
 const [command, ...operands] = process.argv.slice(2);
 const database = new PgTaskboardDatabase(databaseUrl);
 try {
+  // Bootstraps the schema so every command works against a fresh database too.
+  await database.ensureSchema();
   if (command === "issue") {
     const [id, name] = operands;
     if (!id || !name) throw new Error("usage: device-admin.mjs issue <deviceId> <displayName>");

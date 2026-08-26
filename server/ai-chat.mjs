@@ -155,13 +155,13 @@ export class AiChatService {
       }
       return { ...resolved, issue };
     });
-  this.active = new Map();
-  this.listeners = new Map();
-  this.completions = new Map();
-  this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
-    this.#handleAppServerNotification(notification);
-  });
-}
+    this.active = new Map();
+    this.listeners = new Map();
+    this.completions = new Map();
+    this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
+      this.#handleAppServerNotification(notification);
+    });
+  }
 
   // Accessor helpers preserve the historical synchronous contract against the standalone
   // SQLite store while returning real promises once the PostgreSQL backend is active.
@@ -471,7 +471,7 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
       );
-      const run = await this.database.createAiChatRun({ threadId });
+      const run = await this.database.createAiChatRun({ threadId, runnerHost: this.database.runnerHost ?? null });
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
       if (skillIds.length > 0) userEventData.skillIds = skillIds;
@@ -826,7 +826,7 @@ export class AiChatService {
         }
       }
 
-      const run = await this.database.createAiChatRun({ threadId: thread.id });
+      const run = await this.database.createAiChatRun({ threadId: thread.id, runnerHost: this.database.runnerHost ?? null });
       this.#emit(thread.id, { type: "ai.run", run });
       const agentDispatches = nodes.flatMap((node, nodeIndex) => {
         if (node.type !== "agent") return [];

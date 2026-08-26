@@ -55,8 +55,11 @@ fi
 echo "== Database owner Secret =="
 if ! kubectl -n "$NAMESPACE" get secret "$DB_OWNER_SECRET" >/dev/null 2>&1; then
   password=${DB_PASSWORD:-$(openssl rand -hex 16)}
+  # CNPG requires the bootstrap secret to be basic-auth shaped (username must equal owner).
   kubectl -n "$NAMESPACE" create secret generic "$DB_OWNER_SECRET" \
-    --from-literal="password=$password"
+    --from-literal="username=taskboard" \
+    --from-literal="password=$password" \
+    --type="kubernetes.io/basic-auth"
 else
   echo "Secret $DB_OWNER_SECRET already exists — leaving it untouched"
 fi
@@ -71,6 +74,7 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready cluster/taskboard-db --timeou
 render networkpolicy.yaml | kubectl -n "$NAMESPACE" apply -f -
 
 render deployment.yaml | kubectl -n "$NAMESPACE" apply -f -
+render migration-cronjob.yaml | kubectl -n "$NAMESPACE" apply -f -
 if [ -n "$TLS_SECRET" ]; then
   render ingress.yaml | kubectl -n "$NAMESPACE" apply -f -
 else
@@ -88,4 +92,4 @@ echo
 echo "Next steps:"
 echo "* Fresh install: done. Register the first device with scripts/device-admin.mjs."
 echo "* Cutover from phase-1 SQLite: run the one-shot import Job, e.g."
-echo "    kubectl -n $NAMESPACE create job --from=job/taskboard-migrate taskboard-migrate-1"
+echo "    kubectl -n $NAMESPACE create job --from=cronjob/taskboard-migrate taskboard-migrate-$(date +%s)"
