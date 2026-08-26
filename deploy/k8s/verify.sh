@@ -39,7 +39,7 @@ board_http() { # board_http <srcPod> <method> <targetPodIp> <pathWithQuery> [jso
               # Sets REPLY_CODE (first line) and REPLY_BODY (rest).
   local output
   output=$(kubectl -n "$NAMESPACE" exec "$1" -- node --input-type=module -e '
-    const [method, url, auth, body] = process.argv.slice(2);
+    const [method, url, auth, body] = process.argv.slice(1);
     const headers = {};
     if (auth) headers.authorization = "Basic " + Buffer.from(auth).toString("base64");
     if (body) headers["content-type"] = "application/json";

@@ -282,6 +282,10 @@ CREATE TABLE IF NOT EXISTS devices (
   created_at TEXT NOT NULL,
   revoked_at TEXT
 );
+
+-- Idempotent column-level upgrades for databases bootstrapped by earlier revisions of
+-- this schema (CREATE TABLE IF NOT EXISTS never adds columns to existing tables).
+ALTER TABLE ai_chat_runs ADD COLUMN IF NOT EXISTS runner_host TEXT;
 `;
 
 export class PgTaskboardDatabase {
