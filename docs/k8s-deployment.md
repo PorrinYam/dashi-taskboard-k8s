@@ -75,14 +75,18 @@ deploy/k8s/apply.sh                                # env vars as above
 `apply.sh` also accepts `NAMESPACE`, `STORAGE_SIZE` (default `5Gi`), and
 `TRUSTED_HOSTS` (default `$BOARD_HOST`; comma-separate extra hostnames).
 
-Verify (Done #1/#2 evidence):
+Verify (Done #1/#2 evidence) — one shot with the bundled script:
 
 ```bash
-kubectl -n "$NAMESPACE" get pods                          # taskboard ... 1/1 Running
-curl -s -o /dev/null -w "%{http_code}\n" https://"$BOARD_HOST"/api/projects   # 401
-curl -s -o /dev/null -w "%{http_code}\n" -u "host-a:$KEY" \
-  https://"$BOARD_HOST"/api/projects                      # 200
+BOARD_HOST=taskboard.example.com NAMESPACE=taskboard SHARED_KEY="$TASKBOARD_SHARED_KEY" \
+  deploy/k8s/verify.sh
 ```
+
+It prints the pod status, the 401 (no auth) and 200 (Basic auth) status codes
+for `/api/projects`, the public `/health` check, and a live SSE probe that
+must show a `: connected` line within seconds (this catches ingress response
+buffering — the ingress template ships the nginx `proxy-buffering: "off"`
+annotation for exactly that reason; adjust it if you use another controller).
 
 Controller notes: the nginx ingress proxies WebSocket upgrades natively. For
 other controllers add the required Upgrade annotations to
