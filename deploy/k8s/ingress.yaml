@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskboard
+spec:
+  ingressClassName: __INGRESS_CLASS__
+  tls:
+    # tls-begin
+    - hosts:
+        - __BOARD_HOST__
+      secretName: __TLS_SECRET__
+    # tls-end
+  rules:
+    - host: __BOARD_HOST__
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: taskboard
+                port:
+                  number: 80

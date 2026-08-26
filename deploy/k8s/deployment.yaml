@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskboard
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: taskboard
+  template:
+    metadata:
+      labels:
+        app: taskboard
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: taskboard
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 47823
+          env:
+            - name: CODEX_TASKBOARD_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: __SECRET_NAME__
+                  key: sharedKey
+            - name: CODEX_TASKBOARD_TRUSTED_HOSTS
+              valueFrom:
+                configMapKeyRef:
+                  name: taskboard-config
+                  key: trustedHosts
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: taskboard-data
