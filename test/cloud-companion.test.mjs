@@ -651,8 +651,8 @@ test("configured server proxies business APIs without touching local rows and ad
       capabilities: { localAiChat: true },
       mode: "cloud",
       realtime: {
-        transport: "websocket",
-        endpoint: "/api/events",
+        transport: "poll",
+        intervalMs: 2000,
       },
       localCapabilities: { available: true },
       manageTaskboardSkillPath: app.options.skillPath,

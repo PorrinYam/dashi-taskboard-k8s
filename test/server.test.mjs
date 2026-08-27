@@ -521,8 +521,8 @@ test("trusted HTTPS origins do not inherit device-local capabilities from tunnel
     capabilities: { localAiChat: false },
     mode: "cloud",
     realtime: {
-      transport: "websocket",
-      endpoint: "/api/events",
+      transport: "poll",
+      intervalMs: 2000,
     },
     localCapabilities: { available: false },
   });
@@ -547,8 +547,8 @@ test("trusted HTTPS origins do not inherit device-local capabilities from tunnel
     capabilities: { localAiChat: true },
     mode: "cloud",
     realtime: {
-      transport: "websocket",
-      endpoint: "/api/events",
+      transport: "poll",
+      intervalMs: 2000,
     },
     localCapabilities: { available: true },
   });
