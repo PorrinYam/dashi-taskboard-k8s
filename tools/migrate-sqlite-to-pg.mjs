@@ -87,7 +87,7 @@ try {
   const target = new PgTaskboardDatabase(databaseUrl);
   await target.ensureSchema();
 
-  const pool = target.pool;
+  const pool = await target.getPool();
   const report = [];
   let failures = 0;
 

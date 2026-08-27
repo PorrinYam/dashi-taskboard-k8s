@@ -1755,7 +1755,7 @@ export function createTaskboardServer(options = {}) {
       attachmentsDirectory: resolved.attachmentsDirectory,
     });
   if (resolved.databaseUrl) {
-    pgEventBus = new PgEventBus(database.pool, {
+    pgEventBus = new PgEventBus({ getPool: () => database.getPool() }, {
       onEvent: (payload, seq) => events.deliver(payload, seq),
     });
   }

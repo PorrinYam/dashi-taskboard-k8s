@@ -1,4 +1,4 @@
-import pg from "pg";
+import { loadPg } from "./pg-module.mjs";
 
 const NOTIFY_CHANNEL = "taskboard_events";
 const NOTIFY_RESTART_DELAY_MS = 1_000;
@@ -13,8 +13,9 @@ const EVENT_RETENTION_INTERVAL = "24 hours";
 // nothing but the sequence number. Every replica (including the writer) tails new sequences
 // and hands payloads to onEvent, which fans them out to that replica's own connected clients.
 export class PgEventBus {
-  constructor(pool, { onEvent } = {}) {
-    this.pool = pool;
+  // poolSource: { getPool } (lazy database accessor) or a live pg Pool.
+  constructor(poolSource, { onEvent } = {}) {
+    this.poolSource = poolSource;
     this.onEvent = onEvent ?? (() => {});
     this.lastSeq = 0;
     this.client = null;
@@ -25,8 +26,18 @@ export class PgEventBus {
     this.closed = false;
   }
 
+  async #resolvePool() {
+    if (!this.pool) {
+      this.pool = typeof this.poolSource?.getPool === "function"
+        ? await this.poolSource.getPool()
+        : this.poolSource;
+    }
+    return this.pool;
+  }
+
   async start() {
     if (this.closed) return;
+    await this.#resolvePool();
     await this.#ensureConnected();
     await this.#catchUp();
     // Backstop poll: recovers events whose NOTIFY was lost to a connection blip.
@@ -64,7 +75,8 @@ export class PgEventBus {
     if (this.client) return;
     if (!this.connecting) {
       this.connecting = (async () => {
-        const client = new pg.Client({ connectionString: this.pool.options.connectionString });
+        const pg = await loadPg();
+        const client = new (pg.Client ?? pg.default?.Client)({ connectionString: this.pool.options.connectionString });
         client.on("notification", (notification) => {
           void this.#catchUp();
         });

@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import os from "node:os";
-import pg from "pg";
 
+import { loadPg } from "./pg-module.mjs";
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 import {
   ApiError,
@@ -291,39 +291,52 @@ ALTER TABLE ai_chat_runs ADD COLUMN IF NOT EXISTS runner_host TEXT;
 export class PgTaskboardDatabase {
   constructor(databaseUrl) {
     this.databaseUrl = databaseUrl;
-    this.pool = new pg.Pool({ connectionString: databaseUrl, max: 10 });
     this.readyPromise = null;
     this.closed = false;
     // Identity of this server instance for run ownership; in Kubernetes this is the pod name.
     this.runnerHost = process.env.HOSTNAME || os.hostname();
+    // The pool and the pg driver are created lazily (getPool) so the packaged standalone
+    // App never touches the PostgreSQL module.
+    this.pool = null;
     // Uniform attachment-bytes surface consumed by server/app.mjs for both backends.
     this.blobs = {
       put: async (id, body) => {
-        await this.pool.query(
+        await (await this.getPool()).query(
           "INSERT INTO attachment_blobs (id, content) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
           [id, body],
         );
       },
       get: async (id) => {
-        const result = await this.pool.query(
+        const result = await (await this.getPool()).query(
           "SELECT content FROM attachment_blobs WHERE id = $1",
           [id],
         );
         return result.rows[0]?.content ?? null;
       },
       delete: async (id) => {
-        await this.pool.query("DELETE FROM attachment_blobs WHERE id = $1", [id]);
+        await (await this.getPool()).query("DELETE FROM attachment_blobs WHERE id = $1", [id]);
       },
     };
+  }
+
+  // Creates the connection pool on first use, importing the pg driver dynamically.
+  async getPool() {
+    if (this.closed) throw new Error("PgTaskboardDatabase is closed");
+    if (!this.pool) {
+      const pg = await loadPg();
+      const Pool = pg.Pool ?? pg.default?.Pool;
+      this.pool = new Pool({ connectionString: this.databaseUrl, max: 10 });
+    }
+    return this.pool;
   }
 
   async #ready() {
     if (!this.readyPromise) {
       this.readyPromise = (async () => {
         if (this.closed) throw new Error("PgTaskboardDatabase is closed");
-        await this.pool.query(SCHEMA);
+        await (await this.getPool()).query(SCHEMA);
         const timestamp = NOW();
-        await this.pool.query(
+        await (await this.getPool()).query(
           `INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
            VALUES ('local', '全局', NULL, 1, $1, $2)
            ON CONFLICT (id) DO NOTHING`,
@@ -339,7 +352,7 @@ export class PgTaskboardDatabase {
 
   async close() {
     this.closed = true;
-    await this.pool.end();
+    if (this.pool) await this.pool.end();
   }
 
   // Idempotent schema bootstrap for tooling (migration importer, admin scripts).
@@ -349,6 +362,9 @@ export class PgTaskboardDatabase {
 
   // Pool-bound statement runner for reads and single-statement writes.
   #root() {
+    if (!this.pool) {
+      throw new Error("PgTaskboardDatabase pool used before initialization");
+    }
     const pool = this.pool;
     return {
       async run(sql, ...params) {
@@ -369,7 +385,7 @@ export class PgTaskboardDatabase {
   // Transaction-scoped statement runner; every multi-statement mutation goes here.
   async #tx(work) {
     await this.#ready();
-    const client = await this.pool.connect();
+    const client = await (await this.getPool()).connect();
     try {
       await client.query("BEGIN");
       const db = {
@@ -439,7 +455,7 @@ export class PgTaskboardDatabase {
     await this.#ready();
     const timestamp = NOW();
     try {
-      await this.pool.query(
+      await (await this.getPool()).query(
         pgParams(`
           INSERT INTO projects (
             id, name, workspace_path, labels, next_task_number, created_at, updated_at
@@ -682,7 +698,7 @@ export class PgTaskboardDatabase {
         AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)
     `, id, id));
     if (result.changes !== 1) {
-      const row = await this.pool.query(
+      const row = await (await this.getPool()).query(
         "SELECT COUNT(*)::int AS issue_count FROM tasks WHERE project_id = $1",
         [id],
       );
@@ -882,14 +898,14 @@ export class PgTaskboardDatabase {
 
   async createProjectReadmeAttachment(projectId, input) {
     await this.#ready();
-    const exists = await this.pool.query(
+    const exists = await (await this.getPool()).query(
       pgParams("SELECT 1 AS found FROM projects WHERE id = ?"),
       [projectId],
     );
     if (exists.rows.length === 0) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
-    await this.pool.query(pgParams(`
+    await (await this.getPool()).query(pgParams(`
       INSERT INTO project_readme_attachments (
         id, project_id, filename, content_type, size, created_at
       ) VALUES (?, ?, ?, ?, ?, ?)
@@ -2048,7 +2064,7 @@ export class PgTaskboardDatabase {
     await this.#ready();
     const token = randomBytes(32).toString("base64url");
     try {
-      await this.pool.query(
+      await (await this.getPool()).query(
         pgParams(`
           INSERT INTO devices (id, name, token_hash, created_at, revoked_at)
           VALUES (?, ?, ?, ?, NULL)
@@ -2065,7 +2081,7 @@ export class PgTaskboardDatabase {
   }
 
   async listDevices() {
-    const result = await this.pool.query(
+    const result = await (await this.getPool()).query(
       "SELECT id, name, created_at, revoked_at FROM devices ORDER BY created_at, id",
     );
     return result.rows.map((row) => ({
@@ -2078,7 +2094,7 @@ export class PgTaskboardDatabase {
 
   async revokeDevice(id) {
     await this.#ready();
-    const result = await this.pool.query(
+    const result = await (await this.getPool()).query(
       pgParams("UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL"),
       [NOW(), id],
     );
@@ -2090,7 +2106,7 @@ export class PgTaskboardDatabase {
   async authenticateDevice(username, password) {
     if (!username || !password) return null;
     await this.#ready();
-    const row = (await this.pool.query(
+    const row = (await (await this.getPool()).query(
       "SELECT id, name, token_hash, revoked_at FROM devices WHERE id = $1",
       [username],
     )).rows[0];
