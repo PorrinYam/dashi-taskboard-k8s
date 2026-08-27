@@ -2473,6 +2473,7 @@ async function main() {
         && injectedTargets.size === 0
         && codexAppProcesses(options.appPath).length > 0
       ) {
+        const runningCodex = codexAppProcesses(options.appPath);
         const now = Date.now();
         if (now - lastPairingRecoveryLogAt > 15_000) {
           lastPairingRecoveryLogAt = now;
@@ -2484,6 +2485,15 @@ async function main() {
           idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
         } catch (restartError) {
           console.error(`Waiting to re-establish Codex: ${restartError.message}`);
+        }
+        if (nativeCodexBrowser) {
+          // Degraded because the running Codex is a plain instance (no debug port):
+          // ask the launcher to surface the adoption dialog so one confirmation
+          // restores the injected sidebar entry without restarting the app.
+          console.log(JSON.stringify({
+            plainCodexAdoptionRequested: true,
+            pids: runningCodex.map((record) => record.pid),
+          }));
         }
         if (hasOpenPending()) await requestTaskboardOpen().catch(() => {});
         continue;

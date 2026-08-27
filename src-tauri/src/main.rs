@@ -1224,6 +1224,66 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
                         snapshot.message = "任务面板已在现有 Codex 的浏览面板中打开。".into();
                     }
                 });
+            } else if !is_stderr && line.contains("\"plainCodexAdoptionRequested\":true") {
+                // The injector degraded to native-board mode because the running Codex
+                // is a plain instance (no CDP). Surface the upstream consent dialog on
+                // the main thread so one confirmation restores the injected sidebar
+                // entry without restarting the Taskboard app.
+                let plain_pids: Vec<u32> = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|value| {
+                        value.get("pids").and_then(|pids| pids.as_array()).map(|pids| {
+                            pids.iter().filter_map(|pid| pid.as_u64().map(|pid| pid as u32)).collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                if plain_pids.is_empty() {
+                    continue;
+                }
+                let app = app.clone();
+                let state = Arc::clone(&state);
+                let dialog_app = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if state.generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    if state.snapshot.lock().unwrap().child_pid != Some(pid) {
+                        return;
+                    }
+                    let restart = dialog_app
+                        .dialog()
+                        .message("检测到 Codex 未带任务面板注入运行。是否重启 Codex 以恢复任务面板菜单？")
+                        .title("Codex Taskboard")
+                        .kind(MessageDialogKind::Info)
+                        .buttons(MessageDialogButtons::OkCancelCustom(
+                            "重启 Codex".into(),
+                            "取消".into(),
+                        ))
+                        .blocking_show();
+                    append_log(
+                        &state,
+                        if restart {
+                            "Codex adoption approved; restarting the plain Codex instance."
+                        } else {
+                            "Codex adoption declined; keeping native-board mode."
+                        },
+                    );
+                    if !restart {
+                        return;
+                    }
+                    for codex_pid in &plain_pids {
+                        if let Err(error) = quit_codex_normally(*codex_pid) {
+                            append_log(&state, &format!("Codex normal exit failed: {error}"));
+                        }
+                    }
+                    {
+                        let mut snapshot = state.snapshot.lock().unwrap();
+                        snapshot.open_request_pending = true;
+                    }
+                    if let Err(error) = signal_pending_taskboard_open(&state) {
+                        append_log(&state, &format!("Taskboard open signal failed: {error}"));
+                    }
+                });
             } else if !is_stderr && line.contains("\"injected\"") {
                 update_snapshot(&app, &state, |snapshot| {
                     if state.generation.load(Ordering::SeqCst) == generation
