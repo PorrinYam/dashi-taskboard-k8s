@@ -3122,11 +3122,17 @@ export function App() {
         await clearCloudSession().catch(() => {});
         throw probeError;
       }
-      // Cloud mode re-targets every request and realtime transport; a reload is the
-      // smallest reliable switch.
-      window.location.reload();
+      setCloudDialogOpen(false);
+      changeProject(ALL_PROJECTS_ID);
+      await loadProjectList();
+      invalidateCloudData();
+      setAnnouncement(text(
+        `已连接 devtb 云端（${input.remoteUrl}）`,
+        `Connected to the devtb cloud (${input.remoteUrl})`,
+      ));
     } catch (error) {
       setCloudError(errorMessage(error));
+    } finally {
       setCloudSaving(false);
     }
   }
@@ -3137,9 +3143,13 @@ export function App() {
     setCloudError(null);
     try {
       await clearCloudSession();
-      window.location.reload();
+      changeProject(ALL_PROJECTS_ID);
+      await loadProjectList();
+      invalidateCloudData();
+      setAnnouncement(text("已注销 devtb 云端", "Disconnected from the devtb cloud"));
     } catch (error) {
       setCloudError(errorMessage(error));
+    } finally {
       setCloudSaving(false);
     }
   }
