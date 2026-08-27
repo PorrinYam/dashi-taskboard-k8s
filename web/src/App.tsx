@@ -786,6 +786,9 @@ export function App() {
   const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
+  // Server-verified device workspaces (Codex-registered, directory-existence-checked):
+  // the authoritative source for resolving cloud projects to local workspaces.
+  const [verifiedDeviceWorkspaces, setVerifiedDeviceWorkspaces] = useState<Record<string, string>>({});
   const [projectCodexIdentities, setProjectCodexIdentities] = useState(readProjectCodexIdentities);
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
   const [automationPending, setAutomationPending] = useState(false);
@@ -968,6 +971,24 @@ export function App() {
         ) };
       }
       return { ...savedIdentity, unavailableReason: null };
+    }
+
+    // Prefer the server-verified device workspace whose directory name matches the
+    // project name: remembered mappings can point at directories that no longer exist
+    // (repos get moved), while /api/device-workspaces only lists Codex-registered
+    // directories that were verified to exist.
+    const projectNameKey = selectedProject.name.trim().toLowerCase().replace(/\s+/g, "-");
+    const verifiedMatch = Object.entries(verifiedDeviceWorkspaces).find(([, workspacePath]) => (
+      (workspacePath.split("/").pop() ?? "").trim().toLowerCase() === projectNameKey
+    ));
+    if (verifiedMatch) {
+      return {
+        codexProjectId: verifiedMatch[0],
+        codexProjectKind: "local",
+        codexHostId: "local",
+        workspacePath: verifiedMatch[1],
+        unavailableReason: null,
+      };
     }
 
     const effectiveCodexProjectId = selectedProject.id === GLOBAL_PROJECT_ID
@@ -1825,6 +1846,7 @@ export function App() {
         taskboardStorage.setItem(DEVICE_WORKSPACE_PATHS_KEY, JSON.stringify(next));
         return next;
       });
+      setVerifiedDeviceWorkspaces(workspaces);
       setProjects(nextProjects.map((project) => project.id === GLOBAL_PROJECT_ID
         ? {
             ...project,
