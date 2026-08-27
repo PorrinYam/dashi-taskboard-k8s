@@ -191,6 +191,27 @@ export async function syncJiraConnection(): Promise<JiraConnection> {
   return data.connection;
 }
 
+export interface CloudSessionView {
+  mode: "local" | "cloud";
+  remoteUrl?: string;
+  actorName?: string;
+}
+
+export async function configureCloudSession(input: {
+  remoteUrl: string;
+  actorName: string;
+  sharedKey: string;
+}): Promise<CloudSessionView> {
+  return request<CloudSessionView>("/api/local/cloud-session", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function clearCloudSession(): Promise<CloudSessionView> {
+  return request<CloudSessionView>("/api/local/cloud-session", { method: "DELETE" });
+}
+
 export async function getProjectSummary(
   projectId: string,
   signal?: AbortSignal,

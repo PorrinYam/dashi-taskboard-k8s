@@ -20,6 +20,8 @@ import {
   createProject as createProjectRequest,
   createTask as createTaskRequest,
   configureJiraConnection,
+  configureCloudSession,
+  clearCloudSession,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProjectLabel as deleteProjectLabelRequest,
   deleteProject as deleteProjectRequest,
@@ -62,6 +64,7 @@ import { DashboardView } from "./components/DashboardView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
+import { CloudConnectionDialog } from "./components/CloudConnectionDialog";
 import { ArchivedTasksColumn, OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
   resolveInlineMediaMarkdown,
@@ -772,6 +775,9 @@ export function App() {
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [jiraDialogOpen, setJiraDialogOpen] = useState(false);
+  const [cloudDialogOpen, setCloudDialogOpen] = useState(false);
+  const [cloudSaving, setCloudSaving] = useState(false);
+  const [cloudError, setCloudError] = useState<string | null>(null);
   const [jiraConnection, setJiraConnection] = useState<JiraConnection | null>(null);
   const [jiraSaving, setJiraSaving] = useState(false);
   const [jiraSyncing, setJiraSyncing] = useState(false);
@@ -3091,6 +3097,53 @@ export function App() {
     setJiraDialogOpen(true);
   }
 
+  function openCloudDialog() {
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
+    setCloudError(null);
+    setCloudDialogOpen(true);
+  }
+
+  async function saveCloudSession(input: {
+    remoteUrl: string;
+    actorName: string;
+    sharedKey: string;
+  }) {
+    if (cloudSaving) return;
+    setCloudSaving(true);
+    setCloudError(null);
+    try {
+      await configureCloudSession(input);
+      try {
+        // Validate the credentials through the proxy before declaring success; on failure
+        // roll the local config back so the menu keeps offering "连接 devtb".
+        await listProjects();
+      } catch (probeError) {
+        await clearCloudSession().catch(() => {});
+        throw probeError;
+      }
+      // Cloud mode re-targets every request and realtime transport; a reload is the
+      // smallest reliable switch.
+      window.location.reload();
+    } catch (error) {
+      setCloudError(errorMessage(error));
+      setCloudSaving(false);
+    }
+  }
+
+  async function disconnectCloudSession() {
+    if (cloudSaving) return;
+    setCloudSaving(true);
+    setCloudError(null);
+    try {
+      await clearCloudSession();
+      window.location.reload();
+    } catch (error) {
+      setCloudError(errorMessage(error));
+      setCloudSaving(false);
+    }
+  }
+
   async function saveJiraConnection(input: {
     baseUrl: string;
     username: string;
@@ -3386,6 +3439,28 @@ export function App() {
                           {jiraConnection?.configured
                             ? text("Jira 设置", "Jira settings")
                             : text("连接 Jira", "Connect Jira")}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        disabled={openingProjectId !== null || cloudSaving}
+                        title={
+                          taskboardMetadata?.mode === "cloud"
+                            ? text("断开与 devtb 云端的连接", "Disconnect from the devtb cloud")
+                            : undefined
+                        }
+                        onClick={
+                          taskboardMetadata?.mode === "cloud"
+                            ? disconnectCloudSession
+                            : openCloudDialog
+                        }
+                      >
+                        <RelationIcon className="project-avatar" color="currentColor" size={16} />
+                        <span>
+                          {taskboardMetadata?.mode === "cloud"
+                            ? text("注销 devtb", "Disconnect devtb")
+                            : text("连接 devtb", "Connect devtb")}
                         </span>
                       </button>
                       <button
@@ -3858,6 +3933,17 @@ export function App() {
             if (!jiraSaving) setJiraDialogOpen(false);
           }}
           onSave={saveJiraConnection}
+        />
+      )}
+
+      {cloudDialogOpen && (
+        <CloudConnectionDialog
+          saving={cloudSaving}
+          error={cloudError}
+          onClose={() => {
+            if (!cloudSaving) setCloudDialogOpen(false);
+          }}
+          onSave={saveCloudSession}
         />
       )}
 
