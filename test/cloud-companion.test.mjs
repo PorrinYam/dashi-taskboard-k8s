@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { WebSocket, WebSocketServer } from "ws";
+import { WebSocket } from "ws";
 
 import { main } from "../cli/taskctl.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
@@ -393,12 +393,12 @@ test("cloud proxy does not forward browser compression negotiation upstream", as
   assert.deepEqual(await response.json(), { projects: [] });
 });
 
-test("cloud proxy builds an authenticated WebSocket target without exposing credentials in the URL", async () => {
+test("cloud proxy builds an authenticated SSE event-stream target without exposing credentials in the URL", async () => {
   const { createCloudProxy } = await importCloudProxy();
   const proxy = createCloudProxy({ configStore: memoryConfigStore() });
-  const target = await proxy.webSocketTarget();
+  const target = await proxy.eventStreamTarget();
 
-  assert.equal(target.url, "wss://tasks.example.test/api/events");
+  assert.equal(target.url, "https://tasks.example.test/api/events");
   assert.equal(
     target.headers.authorization,
     `Basic ${Buffer.from("Alice:two-person-shared-key").toString("base64")}`,
@@ -406,17 +406,15 @@ test("cloud proxy builds an authenticated WebSocket target without exposing cred
   assert.doesNotMatch(target.url, /Alice|two-person-shared-key/);
 });
 
-test("local companion relays authenticated cloud revision WebSockets", async () => {
+test("local companion relays authenticated cloud realtime events over SSE", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-websocket-"));
   temporaryDirectories.push(directory);
   const upstreamServer = createServer();
-  const upstreamWebSockets = new WebSocketServer({ noServer: true });
   let receivedAuthorization = null;
-  upstreamServer.on("upgrade", (request, socket, head) => {
+  upstreamServer.on("request", (request, response) => {
     receivedAuthorization = request.headers.authorization ?? null;
-    upstreamWebSockets.handleUpgrade(request, socket, head, (webSocket) => {
-      webSocket.send(JSON.stringify({ type: "revision", revision: 42 }));
-    });
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`event: task.moved\ndata: ${JSON.stringify({ type: "task.moved", task: { id: "t1" } })}\n\n`);
   });
   await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
   const upstreamAddress = upstreamServer.address();
@@ -439,7 +437,7 @@ test("local companion relays authenticated cloud revision WebSockets", async () 
       });
       client.once("error", reject);
     });
-    assert.deepEqual(payload, { type: "revision", revision: 42 });
+    assert.deepEqual(payload, { type: "revision", revision: 1 });
     assert.equal(
       receivedAuthorization,
       `Basic ${Buffer.from("Alice:two-person-shared-key").toString("base64")}`,
@@ -447,7 +445,6 @@ test("local companion relays authenticated cloud revision WebSockets", async () 
   } finally {
     client?.terminate();
     await app.close();
-    upstreamWebSockets.close();
     await new Promise((resolve) => upstreamServer.close(resolve));
   }
 });

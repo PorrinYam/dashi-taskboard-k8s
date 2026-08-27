@@ -209,7 +209,7 @@ export function createCloudProxy({
   const setProjectWorkspace = configStore?.setProjectWorkspace?.bind(configStore);
 
   return {
-    async webSocketTarget(pathname = "/api/events") {
+    async eventStreamTarget(pathname = "/api/events") {
       const config = await readConfig();
       if (!config?.remoteUrl || !config.actorName || !config.sharedKey) {
         throw new CloudProxyError(
@@ -229,7 +229,6 @@ export function createCloudProxy({
         );
       }
       const url = new URL(pathname, `${remoteUrl}/`);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
       return {
         url: url.href,
         headers: { authorization: basicAuthorization(config.actorName, config.sharedKey) },

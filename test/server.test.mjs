@@ -556,13 +556,13 @@ test("trusted HTTPS origins do not inherit device-local capabilities from tunnel
   assert.equal((await request(baseUrl, "/api/device-workspaces")).response.status, 200);
 });
 
-test("trusted HTTPS origins apply to cloud WebSocket upgrades without widening loopback routes", async () => {
+test("trusted HTTPS origins apply to cloud realtime upgrades without widening loopback routes", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-trusted-origins-"));
   const trustedOrigin = "https://board.example.test";
   const upstreamServer = createServer();
-  const upstreamWebSockets = new WebSocketServer({ noServer: true });
-  upstreamServer.on("upgrade", (request, socket, head) => {
-    upstreamWebSockets.handleUpgrade(request, socket, head, () => {});
+  upstreamServer.on("request", (request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`event: task.moved\ndata: ${JSON.stringify({ type: "task.moved", task: { id: "t1" } })}\n\n`);
   });
   await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
   const upstreamAddress = upstreamServer.address();
@@ -593,7 +593,6 @@ test("trusted HTTPS origins apply to cloud WebSocket upgrades without widening l
     }
   } finally {
     await app.close();
-    upstreamWebSockets.close();
     await new Promise((resolve) => upstreamServer.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }

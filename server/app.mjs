@@ -2430,6 +2430,22 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { projectId, workspacePath });
       }
 
+      if (pathname === "/api/revisions") {
+        // Realtime baseline for the panel's revision WebSocket: the client opens the
+        // socket and immediately fetches this to learn the current revision. Without
+        // it the client closes its own socket and retries forever, never invalidating.
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const sinceParam = url.searchParams.get("since") ?? "0";
+        if (!/^\d+$/.test(sinceParam) || !Number.isSafeInteger(Number(sinceParam))) {
+          throw new ApiError(400, "INVALID_CURSOR", "since must be a non-negative integer");
+        }
+        const revision = events.revision;
+        return sendJson(response, 200, {
+          changed: revision > Number(sinceParam),
+          revision,
+        });
+      }
+
       if (pathname === "/api/meta") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         if ([...url.searchParams.keys()].length > 0) {
@@ -3393,8 +3409,67 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
+  async function pipeCloudRealtimeEvents(localSocket, target) {
+    let stopped = false;
+    const isOpen = () => !stopped && localSocket.readyState === WebSocketClient.OPEN;
+    localSocket.on("message", () => {
+      stopped = true;
+      localSocket.close(1008, "Client messages are not supported");
+    });
+    localSocket.on("close", () => {
+      stopped = true;
+    });
+    while (isOpen()) {
+      let response;
+      try {
+        response = await fetch(target.url, { headers: target.headers, cache: "no-store" });
+      } catch (error) {
+        console.error(`Cloud realtime stream failed: ${error?.message ?? error}`);
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        continue;
+      }
+      if (!response.ok || !response.body) {
+        throw new Error(`Cloud realtime HTTP ${response.status}`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let streaming = true;
+      while (streaming && isOpen()) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const data = block.split("\n")
+            .filter((line) => line.startsWith("data: "))
+            .map((line) => line.slice(6))
+            .join("\n");
+          if (data) {
+            try {
+              const payload = JSON.parse(data);
+              if (payload && typeof payload.type === "string") {
+                events.deliver(payload, null);
+              }
+            } catch {
+              // A malformed upstream event should not break the stream.
+            }
+            if (isOpen()) {
+              localSocket.send(JSON.stringify({ type: "revision", revision: events.revision }));
+            }
+          }
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+      if (!isOpen()) return;
+      // The upstream stream ended (idle timeout); redial after a short pause.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+  }
+
   server.on("upgrade", async (request, socket, head) => {
-    let remoteSocket;
     try {
       const incomingUrl = new URL(request.url, "http://127.0.0.1");
       if (resolved.instanceToken) {
@@ -3428,68 +3503,21 @@ export function createTaskboardServer(options = {}) {
         return;
       }
       assertLoopbackRequest(request);
-      const target = await cloudProxy.webSocketTarget("/api/events");
-      remoteSocket = new WebSocketClient(target.url, { headers: target.headers });
-      const pendingMessages = [];
-      const queueMessage = (data, isBinary) => pendingMessages.push({ data, isBinary });
-      remoteSocket.on("message", queueMessage);
-      await new Promise((resolve, reject) => {
-        const cleanup = () => {
-          remoteSocket.off("open", onOpen);
-          remoteSocket.off("error", onError);
-          remoteSocket.off("close", onClose);
-        };
-        const onOpen = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = (error) => {
-          cleanup();
-          reject(error);
-        };
-        const onClose = () => {
-          cleanup();
-          reject(new Error("Cloud realtime connection closed before opening"));
-        };
-        remoteSocket.once("open", onOpen);
-        remoteSocket.once("error", onError);
-        remoteSocket.once("close", onClose);
-      });
+      // The remote leg consumes the authenticated SSE stream (proven to pass ingress
+      // with Authorization headers, unlike authenticated WebSocket upgrades) and
+      // re-publishes each event into the local EventHub, whose revision counter is
+      // the single source behind both /api/revisions and the frames sent to clients.
+      const target = await cloudProxy.eventStreamTarget("/api/events");
       cloudRealtimeServer.handleUpgrade(request, socket, head, (localSocket) => {
-        const pair = { localSocket, remoteSocket };
-        cloudRealtimeSockets.add(pair);
-        const removePair = () => cloudRealtimeSockets.delete(pair);
-        const forwardMessage = (data, isBinary) => {
-          if (localSocket.readyState === WebSocketClient.OPEN) {
-            localSocket.send(data, { binary: isBinary });
-          }
-        };
-
-        remoteSocket.off("message", queueMessage);
-        remoteSocket.on("message", forwardMessage);
-        for (const { data, isBinary } of pendingMessages) forwardMessage(data, isBinary);
-
-        localSocket.on("message", () => {
-          localSocket.close(1008, "Client messages are not supported");
-        });
-        localSocket.on("close", (code, reason) => {
-          removePair();
-          closeOrTerminateWebSocket(remoteSocket, code, reason);
-        });
-        localSocket.on("error", () => remoteSocket.terminate());
-
-        remoteSocket.on("close", (code, reason) => {
-          removePair();
-          closeOrTerminateWebSocket(localSocket, code, reason);
-        });
-        remoteSocket.on("error", () => {
+        cloudRealtimeSockets.add(localSocket);
+        void pipeCloudRealtimeEvents(localSocket, target).catch((error) => {
+          console.error(`Cloud realtime bridge failed: ${error?.message ?? error}`);
           if (localSocket.readyState === WebSocketClient.OPEN) {
             localSocket.close(1011, "Cloud realtime connection failed");
           }
         });
       });
     } catch (error) {
-      remoteSocket?.terminate();
       rejectWebSocketUpgrade(socket, error?.status ?? 502, "WebSocket connection failed");
     }
   });
@@ -3532,10 +3560,7 @@ export function createTaskboardServer(options = {}) {
     },
     async close() {
       if (pgEventBus) await pgEventBus.close().catch(() => {});
-      for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
-        localSocket.terminate();
-        remoteSocket.terminate();
-      }
+      for (const localSocket of cloudRealtimeSockets) localSocket.terminate();
       cloudRealtimeSockets.clear();
       for (const webSocket of realtimeRevisionSockets) webSocket.terminate();
       realtimeRevisionSockets.clear();
