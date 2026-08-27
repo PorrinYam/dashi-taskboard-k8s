@@ -324,8 +324,7 @@ export class PgTaskboardDatabase {
     if (this.closed) throw new Error("PgTaskboardDatabase is closed");
     if (!this.pool) {
       const pg = await loadPg();
-      const Pool = pg.Pool ?? pg.default?.Pool;
-      this.pool = new Pool({ connectionString: this.databaseUrl, max: 10 });
+      this.pool = new pg.Pool({ connectionString: this.databaseUrl, max: 10 });
     }
     return this.pool;
   }

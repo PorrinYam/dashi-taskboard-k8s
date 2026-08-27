@@ -2463,46 +2463,44 @@ async function main() {
       // process (and the launcher) stay alive. Re-establish against whatever Codex is
       // running instead of idling until a manual app restart:
       // - a debuggable renderer is re-adopted with full injection (attachExisting);
-      // - a plain renderer (no debug port) degrades to the native-board deep link;
+      // - a plain renderer (no debug port) degrades to the native-board deep link and
+      //   asks the launcher to surface the one-click adoption dialog;
       // - nothing running keeps the existing wait-for-open behaviour.
-      for (const [staleTargetId, staleConnection] of injectedTargets) {
-        if (staleConnection.closed) injectedTargets.delete(staleTargetId);
-      }
-      if (
-        !nativeCodexBrowser
-        && !stopping
-        && injectedTargets.size === 0
-        && codexAppProcesses(options.appPath).length > 0
-      ) {
+      if (!nativeCodexBrowser && !stopping && injectedTargets.size === 0) {
         const runningCodex = codexAppProcesses(options.appPath);
-        const now = Date.now();
-        if (now - lastPairingRecoveryLogAt > 15_000) {
-          lastPairingRecoveryLogAt = now;
-          console.error("Codex pairing lost; re-establishing the Taskboard session.");
-        }
-        let reestablished = false;
-        try {
+        if (runningCodex.length > 0) {
+          const now = Date.now();
+          if (now - lastPairingRecoveryLogAt > 15_000) {
+            lastPairingRecoveryLogAt = now;
+            console.error("Codex pairing lost; re-establishing the Taskboard session.");
+          }
           cdpRuntime?.close?.();
           cdpRuntime = null;
-          idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
-          reestablished = idleAfterNormalExit === false && !nativeCodexBrowser;
-        } catch (restartError) {
-          console.error(`Waiting to re-establish Codex: ${restartError.message}`);
+          let started = false;
+          try {
+            started = await startManagedCodex();
+          } catch (restartError) {
+            console.error(`Waiting to re-establish Codex: ${restartError.message}`);
+          }
+          if (!started) {
+            if (nativeCodexBrowser) {
+              // Degraded because the running Codex is a plain instance (no debug port):
+              // ask the launcher to surface the adoption dialog so one confirmation
+              // restores the injected sidebar entry without restarting the app.
+              console.log(JSON.stringify({
+                plainCodexAdoptionRequested: true,
+                pids: runningCodex.map((record) => record.pid),
+              }));
+            } else {
+              idleAfterNormalExit = true;
+            }
+            if (hasOpenPending()) await requestTaskboardOpen().catch(() => {});
+            continue;
+          }
+          idleAfterNormalExit = false;
+          // Fall through: injectAll below attaches the fresh runtime this very tick;
+          // continuing here would re-enter this branch with an empty map forever.
         }
-        if (nativeCodexBrowser) {
-          // Degraded because the running Codex is a plain instance (no debug port):
-          // ask the launcher to surface the adoption dialog so one confirmation
-          // restores the injected sidebar entry without restarting the app.
-          console.log(JSON.stringify({
-            plainCodexAdoptionRequested: true,
-            pids: runningCodex.map((record) => record.pid),
-          }));
-        }
-        if (hasOpenPending()) await requestTaskboardOpen().catch(() => {});
-        // A re-established runtime must fall through so injectAll attaches and
-        // populates the session map this very tick; continuing would re-enter this
-        // branch forever with an empty map.
-        if (!reestablished) continue;
       }
       if (nativeCodexBrowser) {
         if (codexAppProcesses(options.appPath).length === 0) {

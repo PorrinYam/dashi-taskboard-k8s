@@ -1250,16 +1250,11 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
                     if state.snapshot.lock().unwrap().child_pid != Some(pid) {
                         return;
                     }
-                    let restart = dialog_app
-                        .dialog()
-                        .message("检测到 Codex 未带任务面板注入运行。是否重启 Codex 以恢复任务面板菜单？")
-                        .title("Codex Taskboard")
-                        .kind(MessageDialogKind::Info)
-                        .buttons(MessageDialogButtons::OkCancelCustom(
-                            "重启 Codex".into(),
-                            "取消".into(),
-                        ))
-                        .blocking_show();
+                    let restart = prompt_restart_codex(
+                        &dialog_app,
+                        "检测到 Codex 未带任务面板注入运行。是否重启 Codex 以恢复任务面板菜单？",
+                        "重启 Codex",
+                    );
                     append_log(
                         &state,
                         if restart {
@@ -1276,11 +1271,7 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
                             append_log(&state, &format!("Codex normal exit failed: {error}"));
                         }
                     }
-                    {
-                        let mut snapshot = state.snapshot.lock().unwrap();
-                        snapshot.open_request_pending = true;
-                    }
-                    if let Err(error) = signal_pending_taskboard_open(&state) {
+                    if let Err(error) = queue_taskboard_open(&state) {
                         append_log(&state, &format!("Taskboard open signal failed: {error}"));
                     }
                 });
@@ -1334,16 +1325,11 @@ fn start_launcher_locked(
     #[cfg(target_os = "linux")]
     let ordinary_codex_pid = ordinary_codex_process(&codex_app, &codex_profile)?;
     if let Some(codex_pid) = ordinary_codex_pid {
-        let restart = app
-            .dialog()
-            .message("需要重新启动 Codex 才能显示任务面板")
-            .title("Codex Taskboard")
-            .kind(MessageDialogKind::Info)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "重新启动 Codex".into(),
-                "取消".into(),
-            ))
-            .blocking_show();
+        let restart = prompt_restart_codex(
+            app,
+            "需要重新启动 Codex 才能显示任务面板",
+            "重新启动 Codex",
+        );
         if !restart {
             append_log(state, "Codex restart canceled by user");
             return Ok(update_snapshot(app, state, |snapshot| {
@@ -1639,8 +1625,24 @@ fn restart_launcher(
 }
 
 fn open_taskboard(state: &LauncherState) -> Result<(), String> {
+    queue_taskboard_open(state)
+}
+
+fn queue_taskboard_open(state: &LauncherState) -> Result<(), String> {
     state.snapshot.lock().unwrap().open_request_pending = true;
     signal_pending_taskboard_open(state)
+}
+
+fn prompt_restart_codex(app: &AppHandle, message: &str, confirm_label: &str) -> bool {
+    app.dialog()
+        .message(message.to_string())
+        .title("Codex Taskboard")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            confirm_label.to_string(),
+            "取消".into(),
+        ))
+        .blocking_show()
 }
 
 fn open_taskboard_in_browser(state: &LauncherState) -> Result<(), String> {

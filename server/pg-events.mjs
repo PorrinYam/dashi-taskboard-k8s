@@ -76,7 +76,7 @@ export class PgEventBus {
     if (!this.connecting) {
       this.connecting = (async () => {
         const pg = await loadPg();
-        const client = new (pg.Client ?? pg.default?.Client)({ connectionString: this.pool.options.connectionString });
+        const client = new pg.Client({ connectionString: this.pool.options.connectionString });
         client.on("notification", (notification) => {
           void this.#catchUp();
         });
