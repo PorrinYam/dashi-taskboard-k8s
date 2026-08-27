@@ -266,6 +266,11 @@ export function createCloudProxy({
       headers.delete("connection");
       headers.delete("transfer-encoding");
       headers.delete("accept-encoding");
+      // The embedded panel runs in a sandboxed iframe (Origin: null) or on localhost;
+      // forwarding either value trips the remote board's trusted-origin guard
+      // (403 INVALID_ORIGIN), so browser context headers never travel upstream.
+      headers.delete("origin");
+      headers.delete("referer");
       for (const name of [...headers.keys()]) {
         if (name.toLowerCase().startsWith("x-taskboard-user-")) headers.delete(name);
       }
