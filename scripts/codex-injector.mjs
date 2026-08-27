@@ -1879,6 +1879,7 @@ async function injectTarget(
         currentStatus,
         source,
         sourceHash,
+        taskboardPageUrl,
         removeRegisteredSource: (identifier) => cdp.send(
           "Page.removeScriptToEvaluateOnNewDocument",
           { identifier },
