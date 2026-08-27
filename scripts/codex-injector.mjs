@@ -2109,6 +2109,7 @@ async function main() {
   let runtimePublishPromise = null;
   const injectedTargets = new Map();
   let idleAfterNormalExit = false;
+  let lastPairingRecoveryLogAt = 0;
   let openRequestGeneration = options.open ? 1 : 0;
   let openedRequestGeneration = 0;
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
@@ -2455,6 +2456,37 @@ async function main() {
         try {
           await connection.hostBridge?.publishHeartbeat();
         } catch (_) {}
+      }
+      // Pairing self-healing: heartbeat timeouts close the underlying CDP session, so a
+      // replaced or crashed renderer leaves an empty session map behind while this
+      // process (and the launcher) stay alive. Re-establish against whatever Codex is
+      // running instead of idling until a manual app restart:
+      // - a debuggable renderer is re-adopted with full injection (attachExisting);
+      // - a plain renderer (no debug port) degrades to the native-board deep link;
+      // - nothing running keeps the existing wait-for-open behaviour.
+      for (const [staleTargetId, staleConnection] of injectedTargets) {
+        if (staleConnection.closed) injectedTargets.delete(staleTargetId);
+      }
+      if (
+        !nativeCodexBrowser
+        && !stopping
+        && injectedTargets.size === 0
+        && codexAppProcesses(options.appPath).length > 0
+      ) {
+        const now = Date.now();
+        if (now - lastPairingRecoveryLogAt > 15_000) {
+          lastPairingRecoveryLogAt = now;
+          console.error("Codex pairing lost; re-establishing the Taskboard session.");
+        }
+        try {
+          cdpRuntime?.close?.();
+          cdpRuntime = null;
+          idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
+        } catch (restartError) {
+          console.error(`Waiting to re-establish Codex: ${restartError.message}`);
+        }
+        if (hasOpenPending()) await requestTaskboardOpen().catch(() => {});
+        continue;
       }
       if (nativeCodexBrowser) {
         if (codexAppProcesses(options.appPath).length === 0) {
