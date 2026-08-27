@@ -2479,10 +2479,12 @@ async function main() {
           lastPairingRecoveryLogAt = now;
           console.error("Codex pairing lost; re-establishing the Taskboard session.");
         }
+        let reestablished = false;
         try {
           cdpRuntime?.close?.();
           cdpRuntime = null;
           idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
+          reestablished = idleAfterNormalExit === false && !nativeCodexBrowser;
         } catch (restartError) {
           console.error(`Waiting to re-establish Codex: ${restartError.message}`);
         }
@@ -2496,7 +2498,10 @@ async function main() {
           }));
         }
         if (hasOpenPending()) await requestTaskboardOpen().catch(() => {});
-        continue;
+        // A re-established runtime must fall through so injectAll attaches and
+        // populates the session map this very tick; continuing would re-enter this
+        // branch forever with an empty map.
+        if (!reestablished) continue;
       }
       if (nativeCodexBrowser) {
         if (codexAppProcesses(options.appPath).length === 0) {
