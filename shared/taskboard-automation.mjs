@@ -158,25 +158,12 @@ export function buildTaskboardAutomationSpec(request) {
 }
 
 export function taskboardAutomationPolicyOperation(request, {
-  explicit,
   hasTodo,
-  previousQuotaState,
   quotaState,
-  currentStatus,
 }) {
   if (!request.enabledByUser) return "pause";
   if (hasTodo === false) return "pause";
-  if (
-    !explicit
-    && currentStatus === "PAUSED"
-    && (!request.quotaAware || previousQuotaState === "available")
-  ) return "list";
   if (request.quotaAware && quotaState !== "available") return "pause";
-  if (
-    explicit
-    || currentStatus === undefined
-    || (request.quotaAware && previousQuotaState !== "available")
-  ) return "ensure-active";
   return "ensure-active";
 }
 

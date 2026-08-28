@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -310,6 +310,59 @@ test("cloud companion blocks project moves for issue-linked local AI chats", asy
     assert.equal(payload.error.code, "AI_CHAT_PROJECT_MOVE_BLOCKED");
     assert.equal(upstreamCalls, 0);
     assert.deepEqual(app.database.getAiChatThread(thread.id).origin, thread.origin);
+  } finally {
+    await app.close();
+  }
+});
+
+test("cloud AI catalog accepts an exact Codex-registered project without a manual mapping", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-ai-catalog-"));
+  temporaryDirectories.push(directory);
+  const workspace = path.join(directory, "workspace");
+  await mkdir(workspace);
+  const projectId = "local-codex-project";
+  const codexStatePath = path.join(directory, "codex-state.json");
+  await writeFile(codexStatePath, JSON.stringify({
+    "local-projects": { [projectId]: { rootPaths: [workspace] } },
+  }));
+  const codexExecutable = path.join(directory, "fake-codex.mjs");
+  await writeFile(codexExecutable, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "debug") {
+  process.stdout.write('{"models":[{"slug":"gpt-real","display_name":"GPT Real","description":"","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"service_tiers":[]}]}');
+} else if (args[0] === "app-server") {
+  process.stdin.setEncoding("utf8"); let buffer = "";
+  process.stdin.on("data", chunk => { buffer += chunk; let index;
+    while ((index = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
+      if (!line.trim()) continue; const message = JSON.parse(line);
+      if (message.id === 1) process.stdout.write('{"id":1,"result":{}}\\n');
+      if (message.id === 2) process.stdout.write('{"id":2,"result":{"data":[]}}\\n');
+    }
+  });
+}
+`);
+  await chmod(codexExecutable, 0o755);
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable,
+    codexStatePath,
+    cloudConfigStore: memoryConfigStore(),
+    remoteFetch: async (url) => {
+      if (new URL(url).pathname === "/api/projects") {
+        return jsonResponse({ projects: [{ id: projectId, name: "Codex Project" }] });
+      }
+      return jsonResponse({ error: { code: "NOT_FOUND", message: "Not found" } }, 404);
+    },
+  });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/local/ai/catalog?projectId=${projectId}`,
+    );
+    const catalog = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(catalog.models[0].slug, "gpt-real");
   } finally {
     await app.close();
   }

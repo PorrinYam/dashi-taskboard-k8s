@@ -802,8 +802,7 @@ export class AiChatService {
         if (typeof appServerThreadId !== "string" || !appServerThreadId) {
           throw new Error("Codex did not provide a thread id");
         }
-        this.database.updateAiChatThread(thread.id, { codexThreadId: appServerThreadId })
-          .catch(() => {});
+        await this.database.updateAiChatThread(thread.id, { codexThreadId: appServerThreadId });
       }
 
       const userInput = nodes.flatMap((node, nodeIndex) => {

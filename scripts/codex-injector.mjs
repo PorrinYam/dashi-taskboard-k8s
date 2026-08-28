@@ -1324,13 +1324,6 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         },
       );
       if (result.stale) return result;
-      if (result.hasTodo === false && result.operation === "pause") {
-        current.version += 1;
-        current.request = { ...current.request, enabledByUser: false };
-      } else if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
-        current.version += 1;
-        current.request = { ...current.request, enabledByUser: false };
-      }
       if (result.item?.id) {
         current.request = { ...current.request, automationId: result.item.id };
       }

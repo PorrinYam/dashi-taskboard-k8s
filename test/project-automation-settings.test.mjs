@@ -72,7 +72,7 @@ test("project mapping is based on exact ids and workspace paths, never project n
   assert.match(automationContextSource, /liveProject\.hostId !== savedIdentity\.codexHostId/);
   assert.match(automationContextSource, /liveProject\.workspacePath !== savedIdentity\.workspacePath/);
   assert.match(appSource, /directCodexProject\?\.workspacePath/);
-  assert.match(appSource, /\(deviceWorkspacePaths\[project\.id\] \?\? project\.workspacePath\) === workspacePath/);
+  assert.match(automationContextSource, /project\.workspacePath === workspacePath/);
   assert.match(appSource, /请先在 Codex 中添加并映射该项目目录/);
   assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
 });

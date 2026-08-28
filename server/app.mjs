@@ -1969,6 +1969,7 @@ export function createTaskboardServer(options = {}) {
       projectId,
       project,
       config.projectMappings,
+      resolved.codexStatePath,
     );
     return { ...resolvedWorkspace, issue };
   }

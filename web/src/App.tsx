@@ -786,9 +786,9 @@ export function App() {
   const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
-  // Server-verified device workspaces (Codex-registered, directory-existence-checked):
-  // the authoritative source for resolving cloud projects to local workspaces.
-  const [verifiedDeviceWorkspaces, setVerifiedDeviceWorkspaces] = useState<Record<string, string>>({});
+  // Codex project ids and their registered roots. Keep this separate from the
+  // Taskboard project-to-checkout mappings stored in deviceWorkspacePaths.
+  const [codexProjectWorkspaces, setCodexProjectWorkspaces] = useState<Record<string, string>>({});
   const [projectCodexIdentities, setProjectCodexIdentities] = useState(readProjectCodexIdentities);
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
   const [automationPending, setAutomationPending] = useState(false);
@@ -973,48 +973,49 @@ export function App() {
       return { ...savedIdentity, unavailableReason: null };
     }
 
-    // Prefer the server-verified device workspace whose directory name matches the
-    // project name: remembered mappings can point at directories that no longer exist
-    // (repos get moved), while /api/device-workspaces only lists Codex-registered
-    // directories that were verified to exist.
-    const projectNameKey = selectedProject.name.trim().toLowerCase().replace(/\s+/g, "-");
-    const verifiedMatch = Object.entries(verifiedDeviceWorkspaces).find(([, workspacePath]) => (
-      (workspacePath.split("/").pop() ?? "").trim().toLowerCase() === projectNameKey
-    ));
-    if (verifiedMatch) {
-      return {
-        codexProjectId: verifiedMatch[0],
-        codexProjectKind: "local",
-        codexHostId: "local",
-        workspacePath: verifiedMatch[1],
-        unavailableReason: null,
-      };
-    }
-
     const effectiveCodexProjectId = selectedProject.id === GLOBAL_PROJECT_ID
       ? hostContext?.projectId
       : selectedProject.id;
     const directCodexProject = hostContext?.projects?.find(
       (project) => project.id === effectiveCodexProjectId,
     );
+    const mappedWorkspacePath = selectedProject.workspacePath
+      ?? deviceWorkspacePaths[selectedProject.id];
     const workspacePath = (
       directCodexProject?.projectKind === "remote"
         ? directCodexProject.workspacePath
         : undefined
     )
-      ?? deviceWorkspacePaths[selectedProject.id]
-      ?? selectedProject.workspacePath
+      ?? mappedWorkspacePath
       ?? directCodexProject?.workspacePath
       ?? (
         directCodexProject && hostContext?.projectId === effectiveCodexProjectId
           ? hostContext?.workspacePath
           : undefined
       );
-    const codexProjectId = directCodexProject
-      ? directCodexProject.id
-      : hostContext?.projects?.find(
-        (project) => (deviceWorkspacePaths[project.id] ?? project.workspacePath) === workspacePath,
-      )?.id;
+    const matchingLiveProjects = (hostContext?.projects ?? []).filter(
+      (project) => project.workspacePath === workspacePath,
+    );
+    const savedLocalProject = savedIdentity?.codexProjectKind === "local"
+      ? matchingLiveProjects.find((project) => (
+          project.id === savedIdentity.codexProjectId
+          && (project.projectKind ?? "local") === savedIdentity.codexProjectKind
+          && (project.hostId ?? "local") === savedIdentity.codexHostId
+          && project.workspacePath === savedIdentity.workspacePath
+        ))
+      : undefined;
+    const liveCodexProject = savedLocalProject
+      ?? matchingLiveProjects.find((project) => project.id === effectiveCodexProjectId)
+      ?? (matchingLiveProjects.length === 1 ? matchingLiveProjects[0] : undefined);
+    const matchingRegisteredProjectIds = Object.entries(codexProjectWorkspaces)
+      .filter(([, registeredWorkspacePath]) => registeredWorkspacePath === workspacePath)
+      .map(([projectId]) => projectId);
+    const registeredCodexProjectId = matchingRegisteredProjectIds.includes(effectiveCodexProjectId ?? "")
+      ? effectiveCodexProjectId
+      : matchingRegisteredProjectIds.length === 1
+        ? matchingRegisteredProjectIds[0]
+        : undefined;
+    const codexProjectId = liveCodexProject?.id ?? registeredCodexProjectId;
 
     if (!workspacePath || !codexProjectId) {
       return { unavailableReason: text(
@@ -1028,15 +1029,15 @@ export function App() {
         "Taskboard has not received the Skill path",
       ) };
     }
-    const codexProject = hostContext?.projects?.find((project) => project.id === codexProjectId);
     return {
       workspacePath,
       codexProjectId,
-      codexProjectKind: codexProject?.projectKind ?? "local",
-      codexHostId: codexProject?.hostId ?? "local",
+      codexProjectKind: liveCodexProject?.projectKind ?? "local",
+      codexHostId: liveCodexProject?.hostId ?? "local",
       unavailableReason: null,
     };
   }, [
+    codexProjectWorkspaces,
     deviceWorkspacePaths,
     embedded,
     hostContext,
@@ -1840,13 +1841,16 @@ export function App() {
       setManageTaskboardSkillPath(metadata.manageTaskboardSkillPath ?? "");
       setLocalAiChatAvailable(metadata.capabilities?.localAiChat === true);
       setDeviceWorkspacePaths((current) => {
-        const next = { ...current, ...workspaces };
+        const projectWorkspacePaths = Object.fromEntries(nextProjects.flatMap((project) => (
+          project.workspacePath ? [[project.id, project.workspacePath]] : []
+        )));
+        const next = { ...workspaces, ...current, ...projectWorkspacePaths };
         delete next[GLOBAL_PROJECT_ID];
         if (JSON.stringify(next) === JSON.stringify(current)) return current;
         taskboardStorage.setItem(DEVICE_WORKSPACE_PATHS_KEY, JSON.stringify(next));
         return next;
       });
-      setVerifiedDeviceWorkspaces(workspaces);
+      setCodexProjectWorkspaces(workspaces);
       setProjects(nextProjects.map((project) => project.id === GLOBAL_PROJECT_ID
         ? {
             ...project,

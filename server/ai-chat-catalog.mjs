@@ -223,7 +223,7 @@ async function existingDirectory(value) {
   }
 }
 
-export async function loadDeviceWorkspaces(codexStatePath, database) {
+async function loadCodexWorkspaces(codexStatePath) {
   const workspaces = new Map();
   let localProjects = {};
   try {
@@ -246,6 +246,12 @@ export async function loadDeviceWorkspaces(codexStatePath, database) {
       break;
     }
   }
+
+  return workspaces;
+}
+
+export async function loadDeviceWorkspaces(codexStatePath, database) {
+  const workspaces = await loadCodexWorkspaces(codexStatePath);
 
   for (const project of await database.listProjects()) {
     if (workspaces.has(project.id)) continue;
@@ -289,8 +295,17 @@ export async function resolveAiWorkspace(projectId, codexStatePath, database) {
   return resolvedWorkspace(projectId, project, workspaces);
 }
 
-export async function resolveMappedAiWorkspace(projectId, project, projectMappings = {}) {
+export async function resolveMappedAiWorkspace(
+  projectId,
+  project,
+  projectMappings = {},
+  codexStatePath = null,
+) {
   const workspaces = await loadMappedWorkspaces(projectMappings);
+  if (!workspaces.has(projectId) && codexStatePath) {
+    const registeredWorkspace = (await loadCodexWorkspaces(codexStatePath)).get(projectId);
+    if (registeredWorkspace) workspaces.set(projectId, registeredWorkspace);
+  }
   return resolvedWorkspace(projectId, project, workspaces);
 }
 

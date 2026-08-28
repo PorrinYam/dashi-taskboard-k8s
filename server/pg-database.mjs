@@ -1345,15 +1345,20 @@ export class PgTaskboardDatabase {
           ) AS first_identifier
         FROM projects
         WHERE projects.id = ?
+        FOR UPDATE
       `, input.projectId);
       if (!project) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
       }
 
       const prefix = projectPrefix(project);
+      await db.get(
+        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0)) AS locked",
+        prefix,
+      );
       // Mirrors the SQLite GLOB '<prefix>-[0-9]*' scan; the prefix is alphanumeric-safe in regex.
       const maximumRow = await db.get(`
-        SELECT MAX(CAST(substring(identifier FROM ?) AS INTEGER)) AS number
+        SELECT MAX(CAST(substring(identifier FROM CAST(? AS INTEGER)) AS INTEGER)) AS number
         FROM tasks
         WHERE identifier ~ ('^' || ? || '-[0-9]+$')
       `, prefix.length + 2, prefix);
