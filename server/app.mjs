@@ -2002,13 +2002,13 @@ export function createTaskboardServer(options = {}) {
     const config = await cloudConfig.read();
     if (!config.remoteUrl) {
       if (codexTarget?.codexProjectKind === "remote") {
-        const project = database.getProject(projectId);
+        const project = await database.getProject(projectId);
         if (!project) {
           throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
         }
         let issue;
         if (issueId !== undefined) {
-          issue = database.getTask(issueId);
+          issue = await database.getTask(issueId);
           if (!issue || issue.projectId !== projectId || issue.archivedAt != null) {
             throw new ApiError(
               404,
