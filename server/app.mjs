@@ -55,6 +55,7 @@ const INLINE_ATTACHMENT_TYPES = new Set([
   "text/plain",
 ]);
 const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX = "taskboard.project-board-display-settings.v3.";
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
 const TRUSTED_ORIGINS_ENV = "CODEX_TASKBOARD_TRUSTED_ORIGINS";
 const TRUSTED_HOSTS_ENV = "CODEX_TASKBOARD_TRUSTED_HOSTS";
@@ -146,9 +147,8 @@ function normalizeHostname(hostname) {
   return hostname.toLowerCase().replace(/^\[|\]$/g, "");
 }
 
-function isTrustedNetworkHost(hostname, trustedHosts = new Set()) {
+function isTrustedNetworkHost(hostname) {
   const host = normalizeHostname(hostname);
-  if (trustedHosts.has(host)) return true;
   if (host === "localhost" || host === "::1" || host.endsWith(".local")) return true;
   if (isIP(host) === 4) {
     const octets = host.split(".").map(Number);
@@ -223,36 +223,60 @@ function parseTrustedHosts(value) {
   return hosts;
 }
 
+function parseRequestHost(value) {
+  if (typeof value !== "string" || !value || value !== value.trim()) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  let url;
+  try {
+    url = new URL(`https://${value}`);
+  } catch {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  if (
+    url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+    || !url.hostname
+  ) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  return { hostname: url.hostname, httpsOrigin: url.origin };
+}
+
 function assertTrustedNetworkRequest(
   request,
   allowOpaqueOrigin = false,
   trustedOrigins = new Set(),
   trustedHosts = new Set(),
 ) {
-  let host;
-  try {
-    host = new URL(`http://${request.headers.host ?? ""}`).hostname;
-  } catch {
-    throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
-  }
-  if (!isTrustedNetworkHost(host, trustedHosts)) {
-    throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
+  const host = parseRequestHost(request.headers.host);
+  const localNetworkHost = isTrustedNetworkHost(host.hostname);
+  const configuredTrustedHost = !localNetworkHost && trustedOrigins.has(host.httpsOrigin);
+  if (!localNetworkHost && !configuredTrustedHost && !trustedHosts.has(host.hostname)) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
   }
 
   const origin = request.headers.origin;
-  if (!origin) return;
-  if (TRUSTED_EMBED_ORIGINS.has(origin)) return;
-  if (allowOpaqueOrigin && origin === "null") return;
-  if (trustedOrigins.has(origin)) return;
-  let originHost;
-  try {
-    originHost = new URL(origin).hostname;
-  } catch {
-    throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+  const configuredTrustedOrigin = trustedOrigins.has(origin);
+  if (origin && !configuredTrustedOrigin && !TRUSTED_EMBED_ORIGINS.has(origin)) {
+    if (!(allowOpaqueOrigin && origin === "null")) {
+      let originHostname;
+      try {
+        originHostname = normalizeHostname(new URL(origin).hostname);
+      } catch {
+        throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+      }
+      if (!isTrustedNetworkHost(originHostname) && !trustedHosts.has(originHostname)) {
+        throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+      }
+    }
   }
-  if (!isTrustedNetworkHost(originHost, trustedHosts)) {
-    throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
-  }
+  // trustedHosts only widens the ingress allowlist; the returned flag stays origin-keyed so a
+  // shared-board deployment keeps reaching its own device companion routes.
+  return configuredTrustedHost || configuredTrustedOrigin;
 }
 
 function assertLoopbackRequest(request) {
@@ -972,6 +996,43 @@ function parseAiSetting(value, name, maxLength) {
   return setting;
 }
 
+function parseAiExecutionTarget(value) {
+  const fields = [
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
+  ];
+  const present = fields.filter((field) => value[field] !== undefined);
+  if (present.length === 0) return undefined;
+  if (present.length !== fields.length) {
+    throw new ApiError(400, "INVALID_CODEX_TARGET", "Codex project identity must contain all four fields");
+  }
+  const codexProjectKind = parseAiSetting(value.codexProjectKind, "codexProjectKind", 16);
+  if (codexProjectKind !== "local" && codexProjectKind !== "remote") {
+    throw new ApiError(400, "INVALID_CODEX_TARGET", "'codexProjectKind' must be local or remote");
+  }
+  const workspacePath = parseAiSetting(value.workspacePath, "workspacePath", 4096);
+  if (workspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_CODEX_TARGET", "'workspacePath' cannot contain null bytes");
+  }
+  return {
+    codexProjectId: parseAiSetting(value.codexProjectId, "codexProjectId", 256),
+    codexProjectKind,
+    codexHostId: parseAiSetting(value.codexHostId, "codexHostId", 512),
+    workspacePath,
+  };
+}
+
+function aiExecutionTargetFromQuery(searchParams) {
+  return parseAiExecutionTarget({
+    codexProjectId: searchParams.get("codexProjectId") ?? undefined,
+    codexProjectKind: searchParams.get("codexProjectKind") ?? undefined,
+    codexHostId: searchParams.get("codexHostId") ?? undefined,
+    workspacePath: searchParams.get("workspacePath") ?? undefined,
+  });
+}
+
 function parseAiThreadCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -981,6 +1042,10 @@ function parseAiThreadCreate(body) {
     "model",
     "reasoningEffort",
     "sandbox",
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
   ]));
   return {
     projectId: validateProjectId(body.projectId),
@@ -989,6 +1054,7 @@ function parseAiThreadCreate(body) {
     model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
+    ...parseAiExecutionTarget(body),
   };
 }
 
@@ -1113,7 +1179,17 @@ function parseAiTurn(body) {
 function parseComposerCandidateQuery(searchParams) {
   assertAllowedQuery(
     searchParams,
-    new Set(["projectId", "threadId", "trigger", "query", "surface"]),
+    new Set([
+      "projectId",
+      "threadId",
+      "trigger",
+      "query",
+      "surface",
+      "codexProjectId",
+      "codexProjectKind",
+      "codexHostId",
+      "workspacePath",
+    ]),
     "GET /api/local/ai/composer/candidates",
   );
   let projectId;
@@ -1143,7 +1219,14 @@ function parseComposerCandidateQuery(searchParams) {
   if (!new Set(["ai-chat", "issue-description", "comment"]).has(surface)) {
     throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer surface is invalid");
   }
-  return { projectId, threadId, trigger, query, surface };
+  return {
+    projectId,
+    threadId,
+    trigger,
+    query,
+    surface,
+    ...aiExecutionTargetFromQuery(searchParams),
+  };
 }
 
 function invalidComposerRebindRequest(message) {
@@ -1329,16 +1412,21 @@ async function resolveComposerRebindWorkspace(aiChat, input) {
         "Composer thread does not belong to the selected project",
       );
     }
-    try {
-      if (!(await stat(thread.origin.workspacePath)).isDirectory()) throw new Error("not a directory");
-    } catch {
-      throw new ApiError(
-        409,
-        "PROJECT_WORKSPACE_UNAVAILABLE",
-        "The conversation workspace is not available on this device",
-      );
+    if (thread.origin.codexProjectKind !== "remote") {
+      try {
+        if (!(await stat(thread.origin.workspacePath)).isDirectory()) throw new Error("not a directory");
+      } catch {
+        throw new ApiError(
+          409,
+          "PROJECT_WORKSPACE_UNAVAILABLE",
+          "The conversation workspace is not available on this device",
+        );
+      }
     }
-    return thread.origin.workspacePath;
+    return {
+      workspacePath: thread.origin.workspacePath,
+      composerCatalog: aiChat.composerCatalogForThread(thread),
+    };
   }
   let resolved;
   try {
@@ -1352,7 +1440,7 @@ async function resolveComposerRebindWorkspace(aiChat, input) {
     }
     throw error;
   }
-  return resolved.workspacePath;
+  return { workspacePath: resolved.workspacePath, composerCatalog: aiChat.composerCatalog };
 }
 
 function parseComposerDocument(value) {
@@ -1806,11 +1894,15 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
-  async function updateClientStorage(body) {
+  function parseClientStorageUpdate(body) {
     assertPlainObject(body);
     assertAllowedKeys(body, new Set(["key", "value"]));
     const key = stringField(body.key, "key", { required: true, maxLength: 512 });
     const value = stringField(body.value, "value", { nullable: true, maxLength: 100_000 });
+    return { key, value };
+  }
+
+  async function updateClientStorage({ key, value }) {
     clientStorageWrite = clientStorageWrite.catch(() => {}).then(async () => {
       const entries = await readClientStorage();
       if (value === null) delete entries[key];
@@ -1906,9 +1998,27 @@ export function createTaskboardServer(options = {}) {
     return payload;
   }
 
-  async function resolveAiChatContext(projectId, issueId) {
+  async function resolveAiChatContext(projectId, issueId, codexTarget) {
     const config = await cloudConfig.read();
     if (!config.remoteUrl) {
+      if (codexTarget?.codexProjectKind === "remote") {
+        const project = database.getProject(projectId);
+        if (!project) {
+          throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+        }
+        let issue;
+        if (issueId !== undefined) {
+          issue = database.getTask(issueId);
+          if (!issue || issue.projectId !== projectId || issue.archivedAt != null) {
+            throw new ApiError(
+              404,
+              "AI_CHAT_ISSUE_NOT_FOUND",
+              `Task '${issueId}' is not an active task in project '${projectId}'`,
+            );
+          }
+        }
+        return { project, issue, addDirectories: [], ...codexTarget };
+      }
       let resolvedWorkspace;
       try {
         resolvedWorkspace = await resolveAiWorkspace(
@@ -1965,6 +2075,10 @@ export function createTaskboardServer(options = {}) {
       }
     }
 
+    if (codexTarget?.codexProjectKind === "remote") {
+      return { project, issue, addDirectories: [], ...codexTarget };
+    }
+
     const resolvedWorkspace = await resolveMappedAiWorkspace(
       projectId,
       project,
@@ -1981,6 +2095,7 @@ export function createTaskboardServer(options = {}) {
     manageTaskboardSkillPath: resolved.skillPath,
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
+    remoteAppServerFactory: options.remoteAppServerFactory,
   });
   const projectSummary = new ProjectSummaryService({
     database,
@@ -2133,7 +2248,7 @@ export function createTaskboardServer(options = {}) {
         ? null
         : await authenticateBoardRequest(request);
 
-      assertTrustedNetworkRequest(
+      const configuredTrustedRequest = assertTrustedNetworkRequest(
         request,
         Boolean(resolved.instanceToken),
         resolved.trustedOrigins,
@@ -2170,11 +2285,10 @@ export function createTaskboardServer(options = {}) {
       }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
-      const configuredTrustedOrigin = resolved.trustedOrigins.has(origin);
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
       const isDevelopmentContextsRoute = /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
       if (
-        configuredTrustedOrigin
+        configuredTrustedRequest
         && (
           pathname.startsWith("/api/local/")
           || pathname === "/api/device-workspaces"
@@ -2222,10 +2336,41 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/client-storage") {
         if (request.method === "GET") {
           await clientStorageWrite;
-          return sendJson(response, 200, { entries: await readClientStorage() });
+          const entries = await readClientStorage();
+          const config = await cloudConfig.read();
+          if (config.remoteUrl) {
+            assertLoopbackRequest(request);
+            const shared = await readCloudJson("/api/client-storage");
+            for (const key of Object.keys(entries)) {
+              if (key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)) delete entries[key];
+            }
+            for (const [key, value] of Object.entries(shared.entries)) {
+              if (key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)) entries[key] = value;
+            }
+          }
+          return sendJson(response, 200, { entries });
         }
         if (request.method === "PATCH") {
-          await updateClientStorage(await readJson(request));
+          const update = parseClientStorageUpdate(await readJson(request));
+          const config = await cloudConfig.read();
+          if (
+            config.remoteUrl
+            && update.key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)
+          ) {
+            assertLoopbackRequest(request);
+            return sendFetchResponse(
+              response,
+              await cloudProxy.forward(new Request("http://127.0.0.1/api/client-storage", {
+                method: "PATCH",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(update),
+              })),
+            );
+          }
+          await updateClientStorage(update);
+          if (update.key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)) {
+            events.emit("client-storage.updated", { key: update.key });
+          }
           return sendEmpty(response, 204);
         }
         return methodNotAllowed(response, ["GET", "PATCH"]);
@@ -2453,9 +2598,9 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/meta does not accept query parameters");
         }
         return sendJson(response, 200, {
-          ...(configuredTrustedOrigin ? {} : { manageTaskboardSkillPath: resolved.skillPath }),
+          ...(configuredTrustedRequest ? {} : { manageTaskboardSkillPath: resolved.skillPath }),
           capabilities: {
-            localAiChat: !configuredTrustedOrigin
+            localAiChat: !configuredTrustedRequest
               && isLoopbackAddress(request.socket.remoteAddress),
           },
           ...(capabilityCloudConfig?.remoteUrl
@@ -2469,7 +2614,7 @@ export function createTaskboardServer(options = {}) {
                 transport: "poll",
                 intervalMs: 2_000,
               },
-              localCapabilities: { available: !configuredTrustedOrigin },
+              localCapabilities: { available: !configuredTrustedRequest },
             }
             : {}),
         });
@@ -2477,9 +2622,19 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/local/ai/catalog") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-        assertAllowedQuery(url.searchParams, new Set(["projectId"]), "GET /api/local/ai/catalog");
+        assertAllowedQuery(url.searchParams, new Set([
+          "projectId",
+          "codexProjectId",
+          "codexProjectKind",
+          "codexHostId",
+          "workspacePath",
+        ]), "GET /api/local/ai/catalog");
         const projectId = validateProjectId(url.searchParams.get("projectId") ?? undefined);
-        return sendJson(response, 200, await aiChat.getCatalog(projectId));
+        return sendJson(
+          response,
+          200,
+          await aiChat.getCatalog(projectId, undefined, aiExecutionTargetFromQuery(url.searchParams)),
+        );
       }
 
       if (pathname === "/api/local/ai/composer/candidates") {
@@ -2499,11 +2654,11 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/local/ai/composer/rebind");
         const input = parseComposerRebindRequest(await readJson(request));
-        const workspacePath = await resolveComposerRebindWorkspace(aiChat, input);
+        const { workspacePath, composerCatalog } = await resolveComposerRebindWorkspace(aiChat, input);
         return sendJson(
           response,
           200,
-          await aiChat.composerCatalog.rebindPersistedReferences({
+          await composerCatalog.rebindPersistedReferences({
             workspacePath,
             nodes: input.document.nodes,
           }),
@@ -3139,7 +3294,10 @@ export function createTaskboardServer(options = {}) {
           `%${character.charCodeAt(0).toString(16).toUpperCase()}`
         ));
         const canOpenInline = attachmentContentRoute[2] === "content"
-          && INLINE_ATTACHMENT_TYPES.has(attachment.contentType);
+          && (
+            INLINE_ATTACHMENT_TYPES.has(attachment.contentType)
+            || attachment.contentType.startsWith("video/")
+          );
         response.writeHead(200, {
           "cache-control": "private, no-store",
           "content-disposition": `${canOpenInline ? "inline" : "attachment"}; filename*=UTF-8''${encodedFilename}`,

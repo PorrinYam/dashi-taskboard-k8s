@@ -686,6 +686,58 @@ fn show_error_dialog(app: &AppHandle, title: &str, message: &str) {
 }
 
 #[cfg(target_os = "macos")]
+fn install_taskctl_symlink(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
+    let wrapper_path = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("无法定位当前 App 资源目录：{error}"))?
+        .join("bin/taskctl");
+    let wrapper_path = fs::canonicalize(&wrapper_path).map_err(|error| {
+        format!(
+            "无法定位当前 App 内置命令行工具 {}：{error}",
+            wrapper_path.display()
+        )
+    })?;
+    if !wrapper_path.is_file() {
+        return Err(format!(
+            "当前 App 内置命令行工具不是文件：{}",
+            wrapper_path.display()
+        ));
+    }
+
+    let system_path = PathBuf::from("/opt/homebrew/bin/taskctl");
+    let temporary_path = system_path.with_file_name(format!(
+        ".taskctl-codex-taskboard-{}.tmp",
+        Uuid::new_v4()
+    ));
+    std::os::unix::fs::symlink(&wrapper_path, &temporary_path).map_err(|error| {
+        format!(
+            "无法在 {} 创建符号链接：{error}",
+            system_path.parent().unwrap().display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&temporary_path, &system_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "无法替换系统命令 {}：{error}",
+            system_path.display()
+        ));
+    }
+
+    let installed_target = fs::read_link(&system_path)
+        .map_err(|error| format!("无法验证系统命令 {}：{error}", system_path.display()))?;
+    if installed_target != wrapper_path {
+        return Err(format!(
+            "系统命令未指向当前 App：{} -> {}",
+            system_path.display(),
+            installed_target.display()
+        ));
+    }
+
+    Ok((system_path, wrapper_path))
+}
+
+#[cfg(target_os = "macos")]
 fn find_codex_app(home_directory: &Path) -> Option<PathBuf> {
     [
         PathBuf::from("/Applications/ChatGPT.app"),
@@ -2121,6 +2173,10 @@ fn main() {
                 instance_lock,
             ));
             app.manage(state.clone());
+            #[cfg(target_os = "macos")]
+            if let Err(error) = install_taskctl_symlink(app.handle()) {
+                append_log(&state, &format!("taskctl sync failed: {error}"));
+            }
 
             let app_info = MenuItem::with_id(
                 app,
@@ -2160,6 +2216,21 @@ fn main() {
                 None::<&str>,
             )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            #[cfg(target_os = "macos")]
+            let tray_menu = Menu::with_items(
+                app,
+                &[
+                    &app_info,
+                    &launcher_status,
+                    &open_taskboard_item,
+                    &open_taskboard_web,
+                    &restart_codex,
+                    &check_update,
+                    &autostart,
+                    &quit,
+                ],
+            )?;
+            #[cfg(not(target_os = "macos"))]
             let tray_menu = Menu::with_items(
                 app,
                 &[

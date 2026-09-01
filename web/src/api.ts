@@ -13,6 +13,7 @@ import type {
   ComposerRebindRequest,
   ComposerRebindResponse,
   ComposerTurnInput,
+  CodexProjectIdentity,
   CodexThreadBinding,
   DevelopmentScan,
   HostContext,
@@ -87,7 +88,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (method !== "GET" && method !== "HEAD") {
     headers.set("X-Taskboard-User-Id", currentUserActor.id);
     headers.set("X-Taskboard-User-Name", encodeURIComponent(currentUserActor.name));
-    if (currentUserActor.avatarUrl) {
+    if (
+      currentUserActor.avatarUrl
+      && currentUserActor.avatarUrl.length <= 2048
+      && (
+        currentUserActor.avatarUrl.startsWith("https://")
+        || currentUserActor.avatarUrl.startsWith("http://")
+      )
+    ) {
       headers.set("X-Taskboard-User-Avatar", currentUserActor.avatarUrl);
     }
   }
@@ -302,9 +310,17 @@ export async function publishHostRuntime(context: HostContext): Promise<void> {
 export async function getAiChatCatalog(
   projectId: string,
   signal?: AbortSignal,
+  codexProjectIdentity?: CodexProjectIdentity | null,
 ): Promise<AiChatCatalog> {
+  const query = new URLSearchParams();
+  if (codexProjectIdentity) {
+    query.set("codexProjectId", codexProjectIdentity.codexProjectId);
+    query.set("codexProjectKind", codexProjectIdentity.codexProjectKind);
+    query.set("codexHostId", codexProjectIdentity.codexHostId);
+    query.set("workspacePath", codexProjectIdentity.workspacePath);
+  }
   return request<AiChatCatalog>(
-    `/api/local/ai/catalog?projectId=${encodeURIComponent(projectId)}`,
+    `/api/local/ai/catalog?projectId=${encodeURIComponent(projectId)}${query.size ? `&${query}` : ""}`,
     { signal },
   );
 }
@@ -320,6 +336,10 @@ export async function getAiChatComposerCandidates(
   if (input.projectId) query.set("projectId", input.projectId);
   if (input.threadId) query.set("threadId", input.threadId);
   if (input.surface) query.set("surface", input.surface);
+  if (input.codexProjectId) query.set("codexProjectId", input.codexProjectId);
+  if (input.codexProjectKind) query.set("codexProjectKind", input.codexProjectKind);
+  if (input.codexHostId) query.set("codexHostId", input.codexHostId);
+  if (input.workspacePath) query.set("workspacePath", input.workspacePath);
   return request<ComposerCandidatesResponse>(`/api/local/ai/composer/candidates?${query}`, { signal });
 }
 
@@ -344,7 +364,7 @@ export async function createAiChatThread(input: {
   model?: string;
   reasoningEffort?: string;
   sandbox?: AiChatSandbox;
-}): Promise<AiChatThread> {
+} & Partial<CodexProjectIdentity>): Promise<AiChatThread> {
   const data = await request<{ thread: AiChatThread }>("/api/local/ai/threads", {
     method: "POST",
     body: JSON.stringify(input),
