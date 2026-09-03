@@ -2132,32 +2132,37 @@ fn main() {
                 fs::remove_dir_all(&global_skill)?;
             }
             copy_directory(&bundled_skill, &global_skill)?;
+            // A parallel install needs its own data directory; without this two launchers
+            // share taskboard.sqlite and overwrite each other's launcher-runtime.json.
+            let instance_suffix = option_env!("TASKBOARD_INSTANCE_SUFFIX").unwrap_or("");
             #[cfg(target_os = "macos")]
-            let data_directory = home_directory.join("Library/Application Support/Codex Taskboard");
+            let data_directory = home_directory
+                .join(format!("Library/Application Support/Codex Taskboard{instance_suffix}"));
             #[cfg(target_os = "macos")]
-            let log_directory = home_directory.join("Library/Logs/Codex Taskboard");
+            let log_directory = home_directory
+                .join(format!("Library/Logs/Codex Taskboard{instance_suffix}"));
             #[cfg(target_os = "windows")]
             let data_directory = std::env::var_os("APPDATA")
                 .map(PathBuf::from)
                 .ok_or_else(|| std::io::Error::other("APPDATA is unavailable"))?
-                .join("Codex Taskboard");
+                .join(format!("Codex Taskboard{instance_suffix}"));
             #[cfg(target_os = "windows")]
             let log_directory = std::env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is unavailable"))?
-                .join("Codex Taskboard/Logs");
+                .join(format!("Codex Taskboard{instance_suffix}/Logs"));
             #[cfg(target_os = "linux")]
             let data_directory = std::env::var_os("XDG_DATA_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home_directory.join(".local/share"))
-                .join("Codex Taskboard");
+                .join(format!("Codex Taskboard{instance_suffix}"));
             #[cfg(target_os = "linux")]
             let log_directory = std::env::var_os("XDG_STATE_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home_directory.join(".local/state"))
-                .join("Codex Taskboard");
+                .join(format!("Codex Taskboard{instance_suffix}"));
             fs::create_dir_all(&data_directory)?;
             fs::create_dir_all(&log_directory)?;
             let Some(instance_lock) = acquire_instance_lock(&data_directory.join("launcher.lock"))?
