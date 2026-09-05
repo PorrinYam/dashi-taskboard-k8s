@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -18,7 +19,7 @@ export class ApiError extends Error {
   }
 }
 
-function now() {
+export function now() {
   return new Date().toISOString();
 }
 
@@ -32,7 +33,7 @@ function commentConversationTitle(body) {
   return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
 }
 
-function threadBindingFromRow(row) {
+export function threadBindingFromRow(row) {
   if (
     !row.thread_id
     || !row.thread_codex_project_id
@@ -49,7 +50,7 @@ function threadBindingFromRow(row) {
   };
 }
 
-function legacyLocalThreadIdFromRow(row) {
+export function legacyLocalThreadIdFromRow(row) {
   if (!row.thread_id) return null;
   return [
     row.thread_codex_project_id,
@@ -61,7 +62,7 @@ function legacyLocalThreadIdFromRow(row) {
     : null;
 }
 
-function storedThreadBinding(threadBinding, threadId) {
+export function storedThreadBinding(threadBinding, threadId) {
   if (threadBinding === undefined && (threadId === undefined || threadId === null)) return undefined;
   const binding = threadBinding === undefined ? { threadId } : threadBinding;
   return [
@@ -73,7 +74,7 @@ function storedThreadBinding(threadBinding, threadId) {
   ];
 }
 
-function storedThreadBindingForExisting(current, threadBinding, threadId) {
+export function storedThreadBindingForExisting(current, threadBinding, threadId) {
   if (
     threadBinding === undefined
     && current?.threadBinding
@@ -84,7 +85,7 @@ function storedThreadBindingForExisting(current, threadBinding, threadId) {
   return storedThreadBinding(threadBinding, threadId);
 }
 
-function attachTaskActivity(task, comments, activities, previewImage = null) {
+export function attachTaskActivity(task, comments, activities, previewImage = null) {
   const orderedComments = [...comments].sort((left, right) => (
     left.id.localeCompare(right.id)
   ));
@@ -174,7 +175,7 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
   return task;
 }
 
-function taskActivityFromRow(row) {
+export function taskActivityFromRow(row) {
   return {
     id: row.id,
     taskId: row.task_id,
@@ -187,7 +188,7 @@ function taskActivityFromRow(row) {
   };
 }
 
-function taskFieldChanges(task, changes) {
+export function taskFieldChanges(task, changes) {
   return Object.entries(changes).flatMap(([field, after]) => {
     const before = task[field];
     return JSON.stringify(before) === JSON.stringify(after)
@@ -196,7 +197,7 @@ function taskFieldChanges(task, changes) {
   });
 }
 
-function relationActivityValue(type, task) {
+export function relationActivityValue(type, task) {
   return {
     type,
     identifier: task.identifier,
@@ -205,7 +206,7 @@ function relationActivityValue(type, task) {
   };
 }
 
-function parseAiChatTodoProgress(row) {
+export function parseAiChatTodoProgress(row) {
   try {
     const data = row.data === null ? null : JSON.parse(row.data);
     const detail = typeof data?.detail === "string" ? JSON.parse(data.detail) : data?.detail;
@@ -225,7 +226,7 @@ function parseAiChatTodoProgress(row) {
   }
 }
 
-function taskFromRow(row) {
+export function taskFromRow(row) {
   const developmentContext = row.worktree_path
     ? { type: "worktree", path: row.worktree_path, branch: row.worktree_branch }
     : row.git_branch
@@ -271,7 +272,7 @@ function taskFromRow(row) {
   };
 }
 
-function taskRelationSummaryFromRow(row) {
+export function taskRelationSummaryFromRow(row) {
   return {
     id: row.id,
     identifier: row.identifier,
@@ -290,7 +291,7 @@ function taskRelationSummaryFromRow(row) {
   };
 }
 
-function taskTreeNode(row, parentId, depth, path) {
+export function taskTreeNode(row, parentId, depth, path) {
   return {
     id: row.id,
     parentId,
@@ -306,7 +307,7 @@ function taskTreeNode(row, parentId, depth, path) {
   };
 }
 
-function commentFromRow(row) {
+export function commentFromRow(row) {
   const comment = {
     id: row.id,
     taskId: row.task_id,
@@ -327,7 +328,7 @@ function commentFromRow(row) {
   return comment;
 }
 
-function attachmentFromRow(row) {
+export function attachmentFromRow(row) {
   const attachment = {
     id: row.id,
     taskId: row.task_id,
@@ -342,7 +343,7 @@ function attachmentFromRow(row) {
   return attachment;
 }
 
-function projectFromRow(row) {
+export function projectFromRow(row) {
   return {
     id: row.id,
     name: row.name,
@@ -355,7 +356,7 @@ function projectFromRow(row) {
   };
 }
 
-function projectSummaryFromRow(row) {
+export function projectSummaryFromRow(row) {
   return {
     projectId: row.project_id,
     summary: row.summary,
@@ -365,7 +366,7 @@ function projectSummaryFromRow(row) {
   };
 }
 
-function projectReadmeFromRow(row, projectId) {
+export function projectReadmeFromRow(row, projectId) {
   return {
     projectId: row.project_id ?? projectId,
     content: row.content,
@@ -375,7 +376,7 @@ function projectReadmeFromRow(row, projectId) {
   };
 }
 
-function projectReadmeAttachmentFromRow(row) {
+export function projectReadmeAttachmentFromRow(row) {
   return {
     id: row.id,
     projectId: row.project_id,
@@ -387,7 +388,7 @@ function projectReadmeAttachmentFromRow(row) {
   };
 }
 
-function aiChatRunFromRow(row) {
+export function aiChatRunFromRow(row) {
   return {
     id: row.id,
     threadId: row.thread_id,
@@ -399,7 +400,7 @@ function aiChatRunFromRow(row) {
   };
 }
 
-function aiChatThreadFromRow(row) {
+export function aiChatThreadFromRow(row) {
   return {
     id: row.id,
     title: row.title,
@@ -425,7 +426,7 @@ function aiChatThreadFromRow(row) {
   };
 }
 
-function aiChatEventFromRow(row) {
+export function aiChatEventFromRow(row) {
   return {
     id: row.id,
     threadId: row.thread_id,
@@ -438,7 +439,7 @@ function aiChatEventFromRow(row) {
   };
 }
 
-function projectPrefix(project) {
+export function projectPrefix(project) {
   const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
   const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
   if (existingPrefix && /^[A-Z0-9]+$/i.test(existingPrefix) && existingPrefix !== idPrefix) return existingPrefix;
@@ -447,11 +448,42 @@ function projectPrefix(project) {
   return namePrefix || idPrefix.slice(0, 3);
 }
 
+export class FilesystemAttachmentStore {
+  constructor(directory) {
+    this.directory = directory;
+  }
+
+  async put(id, body) {
+    await mkdir(this.directory, { recursive: true });
+    await writeFile(path.join(this.directory, id), body, { flag: "wx" });
+  }
+
+  async get(id) {
+    try {
+      return await readFile(path.join(this.directory, id));
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async delete(id) {
+    try {
+      await unlink(path.join(this.directory, id));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
 export class TaskboardDatabase {
-  constructor(filename) {
+  constructor(filename, { attachmentsDirectory } = {}) {
     mkdirSync(path.dirname(filename), { recursive: true });
     this.database = new DatabaseSync(filename);
     this.database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+    this.attachmentsDirectory = attachmentsDirectory
+      ?? path.join(path.dirname(filename), "attachments");
+    this.blobs = new FilesystemAttachmentStore(this.attachmentsDirectory);
     this.#migrate();
     this.interruptAbandonedAiChatRuns();
   }
@@ -2081,6 +2113,7 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    this.#assertThreadBindingOwnership(current, threadBinding, threadId);
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
@@ -2222,6 +2255,7 @@ export class TaskboardDatabase {
     if (current.archivedAt !== null) {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
     }
+    this.#assertThreadBindingOwnership(current, threadBinding, threadId);
     if (status !== current.status && sortOrder === undefined) {
       const row = this.database.prepare(`
         SELECT MIN(sort_order) AS minimum
@@ -2271,6 +2305,7 @@ export class TaskboardDatabase {
   archiveTask(id, version, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    this.#assertThreadBindingOwnership(current, threadBinding, threadId);
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
@@ -3003,6 +3038,25 @@ export class TaskboardDatabase {
       throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${id}' does not exist`);
     }
     return comment;
+  }
+
+  #assertThreadBindingOwnership(current, threadBinding, threadId) {
+    const stored = current.threadBinding;
+    if (!stored?.codexHostId) return;
+    if (threadBinding === null) return;
+    if (threadBinding !== undefined) {
+      if (
+        threadBinding.codexHostId === stored.codexHostId
+        && threadBinding.threadId === stored.threadId
+      ) return;
+      throw new ApiError(409, "BINDING_CONFLICT", "Issue is bound to another Codex host", {
+        codexHostId: stored.codexHostId,
+      });
+    }
+    if (threadId === stored.threadId) return;
+    throw new ApiError(409, "BINDING_CONFLICT", "Issue is bound to another Codex host", {
+      codexHostId: stored.codexHostId,
+    });
   }
 
   #requireVersion(task, expectedVersion) {

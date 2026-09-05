@@ -27,7 +27,13 @@ export function isLocalCompanionRoute(pathname) {
 }
 
 function basicAuthorization(actorName, sharedKey) {
-  return `Basic ${Buffer.from(`${actorName}:${sharedKey}`, "utf8").toString("base64")}`;
+  // Device credentials travel as a single secret string "deviceId:token" (the same shape
+  // issued by scripts/device-admin.mjs); boards still running the legacy shared-key model
+  // accept any username, so fall back to the configured actor name when no separator exists.
+  const separator = sharedKey.indexOf(":");
+  const username = separator === -1 ? actorName : sharedKey.slice(0, separator);
+  const password = separator === -1 ? sharedKey : sharedKey.slice(separator + 1);
+  return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
 async function prepareRequest(request, {
@@ -203,7 +209,7 @@ export function createCloudProxy({
   const setProjectWorkspace = configStore?.setProjectWorkspace?.bind(configStore);
 
   return {
-    async webSocketTarget(pathname = "/api/events") {
+    async eventStreamTarget(pathname = "/api/events") {
       const config = await readConfig();
       if (!config?.remoteUrl || !config.actorName || !config.sharedKey) {
         throw new CloudProxyError(
@@ -223,7 +229,6 @@ export function createCloudProxy({
         );
       }
       const url = new URL(pathname, `${remoteUrl}/`);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
       return {
         url: url.href,
         headers: { authorization: basicAuthorization(config.actorName, config.sharedKey) },
@@ -260,6 +265,11 @@ export function createCloudProxy({
       headers.delete("connection");
       headers.delete("transfer-encoding");
       headers.delete("accept-encoding");
+      // The embedded panel runs in a sandboxed iframe (Origin: null) or on localhost;
+      // forwarding either value trips the remote board's trusted-origin guard
+      // (403 INVALID_ORIGIN), so browser context headers never travel upstream.
+      headers.delete("origin");
+      headers.delete("referer");
       for (const name of [...headers.keys()]) {
         if (name.toLowerCase().startsWith("x-taskboard-user-")) headers.delete(name);
       }

@@ -139,6 +139,9 @@ function normalizedAppServerItem(item) {
 }
 
 export class AiChatService {
+  // Serializes async database writes from app-server notifications so events stay ordered.
+  #appServerEventChain = Promise.resolve();
+
   constructor(options) {
     this.database = options.database;
     this.codexExecutable = options.codexExecutable;
@@ -161,7 +164,7 @@ export class AiChatService {
       const resolved = await resolveAiWorkspace(projectId, this.codexStatePath, this.database);
       let issue;
       if (issueId !== undefined) {
-        issue = this.database.getTask(issueId);
+        issue = await this.database.getTask(issueId);
         if (!issue || issue.projectId !== projectId || issue.archivedAt != null) {
           throw new ApiError(
             404,
@@ -178,6 +181,19 @@ export class AiChatService {
     this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
       this.#handleAppServerNotification(this.appServer, notification);
     });
+  }
+
+  // Accessor helpers preserve the historical synchronous contract against the standalone
+  // SQLite store while returning real promises once the PostgreSQL backend is active.
+  #gate(value, finalize) {
+    if (value && typeof value.then === "function") {
+      return value.then((resolved) => {
+        finalize(resolved);
+        return resolved;
+      });
+    }
+    finalize(value);
+    return value;
   }
 
   #runtimeForTarget(target) {
@@ -204,12 +220,7 @@ export class AiChatService {
     return this.#runtimeForTarget(codexTargetFromOrigin(thread.origin));
   }
 
-  listThreads() {
-    return this.database.listAiChatThreads();
-  }
-
-  getThread(threadId) {
-    const thread = this.database.getAiChatThread(threadId);
+  #requireThreadValue(thread, threadId) {
     if (!thread) {
       throw new ApiError(
         404,
@@ -217,28 +228,50 @@ export class AiChatService {
         `AI chat thread '${threadId}' does not exist`,
       );
     }
-    return thread;
   }
 
-  getThreadSnapshot(threadId) {
-    const thread = this.getThread(threadId);
-    return {
-      thread,
-      events: this.database.listAiChatEvents(threadId),
-      runs: this.database.listAiChatRuns(threadId),
-    };
+  #requireRunValue(run, runId) {
+    if (!run) {
+      throw new ApiError(404, "AI_CHAT_RUN_NOT_FOUND", `AI chat run '${runId}' does not exist`);
+    }
   }
 
   composerCatalogForThread(thread) {
     return this.#runtimeForThread(thread).composerCatalog;
   }
 
-  getRun(runId) {
-    const run = this.database.getAiChatRun(runId);
-    if (!run) {
-      throw new ApiError(404, "AI_CHAT_RUN_NOT_FOUND", `AI chat run '${runId}' does not exist`);
+  listThreads() {
+    return this.database.listAiChatThreads();
+  }
+
+  getThread(threadId) {
+    return this.#gate(
+      this.database.getAiChatThread(threadId),
+      (thread) => this.#requireThreadValue(thread, threadId),
+    );
+  }
+
+  getThreadSnapshot(threadId) {
+    const build = (thread, events, runs) => ({ thread, events, runs });
+    const threadValue = this.getThread(threadId);
+    if (threadValue && typeof threadValue.then === "function") {
+      return threadValue.then((thread) => Promise.all([
+        this.database.listAiChatEvents(threadId),
+        this.database.listAiChatRuns(threadId),
+      ]).then(([events, runs]) => build(thread, events, runs)));
     }
-    return run;
+    return build(
+      threadValue,
+      this.database.listAiChatEvents(threadId),
+      this.database.listAiChatRuns(threadId),
+    );
+  }
+
+  getRun(runId) {
+    return this.#gate(
+      this.database.getAiChatRun(runId),
+      (run) => this.#requireRunValue(run, runId),
+    );
   }
 
   subscribe(threadId, listener) {
@@ -287,7 +320,7 @@ export class AiChatService {
       : undefined;
     if (threadId !== undefined) {
       try {
-        thread = this.getThread(threadId);
+        thread = await this.getThread(threadId);
       } catch (error) {
         if (error instanceof ApiError && error.code === "AI_CHAT_THREAD_NOT_FOUND") {
           throw new ApiError(
@@ -348,7 +381,7 @@ export class AiChatService {
   }
 
   async compactThread(threadId) {
-    const thread = this.getThread(threadId);
+    const thread = await this.getThread(threadId);
     if (thread.status === "running") {
       throw new ApiError(409, "AI_CHAT_THREAD_RUNNING", "Cannot compact a running conversation");
     }
@@ -391,7 +424,7 @@ export class AiChatService {
   }
 
   async updateThread(threadId, changes) {
-    let thread = this.getThread(threadId);
+    let thread = await this.getThread(threadId);
     const changesSettings = ["model", "reasoningEffort", "sandbox"].some(
       (key) => Object.hasOwn(changes, key),
     );
@@ -404,7 +437,7 @@ export class AiChatService {
         undefined,
         codexTargetFromOrigin(thread.origin),
       );
-      thread = this.getThread(threadId);
+      thread = await this.getThread(threadId);
       const model = this.#resolveModel(catalog, changes.model ?? thread.model);
       const reasoningEffort = changes.reasoningEffort ?? thread.reasoningEffort;
       this.#validateReasoningEffort(model, reasoningEffort);
@@ -420,8 +453,8 @@ export class AiChatService {
     return this.database.updateAiChatThread(threadId, changes);
   }
 
-  deleteThread(threadId) {
-    const thread = this.getThread(threadId);
+  async deleteThread(threadId) {
+    const thread = await this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
         409,
@@ -433,7 +466,7 @@ export class AiChatService {
   }
 
   async startTurn(threadId, input) {
-    let thread = this.getThread(threadId);
+    let thread = await this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
         409,
@@ -461,7 +494,7 @@ export class AiChatService {
     );
     const catalog = await this.getCatalog(thread.origin.projectId, resolved, codexTarget);
 
-    thread = this.getThread(threadId);
+    thread = await this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
         409,
@@ -520,7 +553,7 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
       );
-      const run = this.database.createAiChatRun({ threadId });
+      const run = await this.database.createAiChatRun({ threadId, runnerHost: this.database.runnerHost ?? null });
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
       if (skillIds.length > 0) userEventData.skillIds = skillIds;
@@ -531,7 +564,7 @@ export class AiChatService {
           size,
         }));
       }
-      const userEvent = this.database.insertAiChatEvent({
+      const userEvent = await this.database.insertAiChatEvent({
         threadId,
         runId: run.id,
         type: "user_message",
@@ -551,7 +584,7 @@ export class AiChatService {
         args,
         prompt,
         env: this.processEnv,
-        onRawEvent: (raw) => {
+        onRawEvent: async (raw) => {
           const normalized = normalizeCodexEvent(raw);
           if (!normalized) return;
           if (normalized.kind === "thread.started") {
@@ -562,10 +595,10 @@ export class AiChatService {
               throw new Error("Codex returned an unexpected thread id");
             }
             startedThreadId = normalized.threadId;
-            this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
+            await this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
             return;
           }
-          const event = this.database.insertAiChatEvent({
+          const event = await this.database.insertAiChatEvent({
             threadId,
             runId: run.id,
             type: normalized.type,
@@ -621,12 +654,12 @@ export class AiChatService {
   }
 
   async interrupt(runId) {
-    let run = this.getRun(runId);
+    let run = await this.getRun(runId);
     if (run.status !== "running") return run;
 
     const active = this.active.get(runId);
     if (!active) {
-      run = this.database.updateAiChatRun(runId, {
+      run = await this.database.updateAiChatRun(runId, {
         status: "interrupted",
         error: "Interrupted",
         finishedAt: new Date().toISOString(),
@@ -808,12 +841,15 @@ export class AiChatService {
       if (typeof appServerThreadId !== "string" || !appServerThreadId) {
         throw new Error("Codex did not provide a thread id");
       }
-      this.database.updateAiChatThread(thread.id, { codexThreadId: appServerThreadId });
+      await this.database.updateAiChatThread(thread.id, { codexThreadId: appServerThreadId });
     }
 
-    const run = this.database.createAiChatRun({ threadId: thread.id });
+    const run = await this.database.createAiChatRun({
+      threadId: thread.id,
+      runnerHost: this.database.runnerHost ?? null,
+    });
     this.#emit(thread.id, { type: "ai.run", run });
-    const storedUserEvent = this.database.insertAiChatEvent({
+    const storedUserEvent = await this.database.insertAiChatEvent({
       threadId: thread.id,
       runId: run.id,
       type: "user_message",
@@ -914,7 +950,7 @@ export class AiChatService {
       codexTarget,
     );
     const runtime = this.#runtimeForTarget(resolved);
-    thread = this.getThread(thread.id);
+    thread = await this.getThread(thread.id);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(409, "THREAD_BUSY", `AI chat thread '${thread.id}' has a running turn`);
     }
@@ -1050,12 +1086,16 @@ export class AiChatService {
     if (notification.method === "item/completed") {
       const normalized = normalizedAppServerItem(params.item);
       if (!normalized) return;
-      const event = this.database.insertAiChatEvent({
-        threadId: active.threadId,
-        runId: active.run.id,
-        ...normalized,
-      });
-      this.#emit(active.threadId, { type: "ai.event", event });
+      this.#appServerEventChain = this.#appServerEventChain
+        .then(async () => {
+          const event = await this.database.insertAiChatEvent({
+            threadId: active.threadId,
+            runId: active.run.id,
+            ...normalized,
+          });
+          this.#emit(active.threadId, { type: "ai.event", event });
+        })
+        .catch(() => {});
       return;
     }
     if (notification.method !== "turn/completed") return;
@@ -1080,7 +1120,7 @@ export class AiChatService {
     if (status === "failed") publicError = cappedError(error) || "Codex turn failed";
     try {
       if (status === "failed") {
-        const errorEvent = this.database.insertAiChatEvent({
+        const errorEvent = await this.database.insertAiChatEvent({
           threadId: active.threadId,
           runId: active.run.id,
           type: "error",
@@ -1090,7 +1130,7 @@ export class AiChatService {
         });
         this.#emit(active.threadId, { type: "ai.event", event: errorEvent });
       }
-      const run = this.database.updateAiChatRun(active.run.id, {
+      const run = await this.database.updateAiChatRun(active.run.id, {
         status,
         exitCode: null,
         error: publicError,
@@ -1177,7 +1217,7 @@ export class AiChatService {
 
     try {
       if (status === "failed" && terminalOutcome() !== "failed") {
-        const errorEvent = this.database.insertAiChatEvent({
+        const errorEvent = await this.database.insertAiChatEvent({
           threadId: run.threadId,
           runId: run.id,
           type: "error",
@@ -1187,7 +1227,7 @@ export class AiChatService {
         });
         this.#emit(run.threadId, { type: "ai.event", event: errorEvent });
       }
-      const updated = this.database.updateAiChatRun(run.id, {
+      const updated = await this.database.updateAiChatRun(run.id, {
         status,
         exitCode: result?.exitCode ?? null,
         error: publicError === null ? null : cappedError(publicError),

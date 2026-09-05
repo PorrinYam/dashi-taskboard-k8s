@@ -62,11 +62,11 @@ export class ProjectSummaryService {
     void this.refreshDueProjects();
   }
 
-  get(projectId) {
-    if (!this.database.getProject(projectId)) {
+  async get(projectId) {
+    if (!await this.database.getProject(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' was not found`);
     }
-    const summary = this.database.getProjectSummary(projectId);
+    const summary = await this.database.getProjectSummary(projectId);
     if (isDue(summary)) void this.refresh(projectId);
     return {
       projectId,
@@ -88,16 +88,16 @@ export class ProjectSummaryService {
   }
 
   async refreshDueProjects() {
-    for (const summary of this.database.listProjectSummaries()) {
+    for (const summary of await this.database.listProjectSummaries()) {
       if (isDue(summary)) await this.refresh(summary.projectId);
     }
   }
 
   async #generate(projectId, active) {
     try {
-      const project = this.database.getProject(projectId);
+      const project = await this.database.getProject(projectId);
       if (!project) return;
-      const tasks = this.database.listTasks({ projectId, archived: "false" });
+      const tasks = await this.database.listTasks({ projectId, archived: "false" });
       let generatedSummary = "";
       let terminalError = "";
       const { child, completion } = spawnCodexTurn({
@@ -138,10 +138,10 @@ export class ProjectSummaryService {
         throw new Error(terminalError || `Codex 退出码 ${result.exitCode}`);
       }
       if (!generatedSummary) throw new Error("Codex 没有返回项目总结");
-      this.database.saveProjectSummary(projectId, generatedSummary);
+      await this.database.saveProjectSummary(projectId, generatedSummary);
     } catch (error) {
       if (!this.closed) {
-        this.database.saveProjectSummaryError(
+        await this.database.saveProjectSummaryError(
           projectId,
           error instanceof Error ? error.message : String(error),
         );

@@ -1,0 +1,70 @@
+# One-shot data cutover: imports the phase-1 SQLite board into PostgreSQL.
+# The old taskboard-data PVC is mounted read-only; the importer never writes to it.
+# Packaged as a suspended CronJob so kubectl's only supported instantiation path works
+# and every cutover attempt gets a fresh, uniquely named Job:
+#   kubectl -n <ns> create job --from=cronjob/taskboard-migrate taskboard-migrate-$(date +%s)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: taskboard-migrate
+spec:
+  # Never fires on a schedule; instantiated manually for each cutover run.
+  schedule: "0 0 30 2 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app: taskboard
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: migrate
+              image: __IMAGE__
+              imagePullPolicy: IfNotPresent
+              command:
+                - node
+                - tools/migrate-sqlite-to-pg.mjs
+                - --sqlite
+                - /legacy/data/taskboard.sqlite
+              env:
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: taskboard-db-owner
+                      key: password
+                - name: DATABASE_URL
+                  value: "postgres://taskboard:$(DB_PASSWORD)@taskboard-db-rw:5432/taskboard"
+              volumeMounts:
+                - name: legacy-data
+                  mountPath: /legacy/data
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+          volumes:
+            - name: legacy-data
+              persistentVolumeClaim:
+                claimName: taskboard-data

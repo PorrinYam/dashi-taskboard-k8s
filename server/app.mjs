@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -31,6 +31,8 @@ import {
 import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
+import { PgEventBus } from "./pg-events.mjs";
+import { PgTaskboardDatabase } from "./pg-database.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -56,6 +58,7 @@ const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX = "taskboard.project-board-display-settings.v3.";
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
 const TRUSTED_ORIGINS_ENV = "CODEX_TASKBOARD_TRUSTED_ORIGINS";
+const TRUSTED_HOSTS_ENV = "CODEX_TASKBOARD_TRUSTED_HOSTS";
 const CODEX_AGENT_ACTOR = {
   type: "agent",
   id: "codex-agent",
@@ -200,6 +203,26 @@ function parseTrustedOrigins(value) {
   return origins;
 }
 
+function parseTrustedHosts(value) {
+  if (value === undefined) return new Set();
+  const configured = String(value).trim();
+  if (!configured) {
+    throw new Error(`${TRUSTED_HOSTS_ENV} must not be empty when configured`);
+  }
+  const hosts = new Set();
+  for (const rawHost of configured.split(",")) {
+    const host = normalizeHostname(rawHost.trim());
+    if (!host || host !== rawHost.trim() || host.includes("*") || /[/:@?#[\]]/.test(host)) {
+      throw new Error(`${TRUSTED_HOSTS_ENV} must be a comma-separated list of exact hostnames`);
+    }
+    if (hosts.has(host)) {
+      throw new Error(`${TRUSTED_HOSTS_ENV} must not contain duplicate hostnames`);
+    }
+    hosts.add(host);
+  }
+  return hosts;
+}
+
 function parseRequestHost(value) {
   if (typeof value !== "string" || !value || value !== value.trim()) {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
@@ -223,11 +246,16 @@ function parseRequestHost(value) {
   return { hostname: url.hostname, httpsOrigin: url.origin };
 }
 
-function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trustedOrigins = new Set()) {
+function assertTrustedNetworkRequest(
+  request,
+  allowOpaqueOrigin = false,
+  trustedOrigins = new Set(),
+  trustedHosts = new Set(),
+) {
   const host = parseRequestHost(request.headers.host);
-  const trustedNetworkHost = isTrustedNetworkHost(host.hostname);
-  const configuredTrustedHost = !trustedNetworkHost && trustedOrigins.has(host.httpsOrigin);
-  if (!trustedNetworkHost && !configuredTrustedHost) {
+  const localNetworkHost = isTrustedNetworkHost(host.hostname);
+  const configuredTrustedHost = !localNetworkHost && trustedOrigins.has(host.httpsOrigin);
+  if (!localNetworkHost && !configuredTrustedHost && !trustedHosts.has(host.hostname)) {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
   }
 
@@ -235,17 +263,19 @@ function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trusted
   const configuredTrustedOrigin = trustedOrigins.has(origin);
   if (origin && !configuredTrustedOrigin && !TRUSTED_EMBED_ORIGINS.has(origin)) {
     if (!(allowOpaqueOrigin && origin === "null")) {
-      let originHost;
+      let originHostname;
       try {
-        originHost = new URL(origin).hostname;
+        originHostname = normalizeHostname(new URL(origin).hostname);
       } catch {
         throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
       }
-      if (!isTrustedNetworkHost(originHost)) {
+      if (!isTrustedNetworkHost(originHostname) && !trustedHosts.has(originHostname)) {
         throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
       }
     }
   }
+  // trustedHosts only widens the ingress allowlist; the returned flag stays origin-keyed so a
+  // shared-board deployment keeps reaching its own device companion routes.
   return configuredTrustedHost || configuredTrustedOrigin;
 }
 
@@ -579,9 +609,49 @@ function requestHeader(request, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function actorFromRequest(request) {
+function parseBasicCredentials(request) {
+  const match = /^Basic (.+)$/.exec(requestHeader(request, "authorization") ?? "");
+  if (!match) return null;
+  const decoded = Buffer.from(match[1], "base64").toString("utf8");
+  const separator = decoded.indexOf(":");
+  if (separator === -1) return null;
+  return {
+    username: decoded.slice(0, separator),
+    password: decoded.slice(separator + 1),
+  };
+}
+
+function assertSharedSecretRequest(request, sharedSecret) {
+  const match = /^Basic (.+)$/.exec(requestHeader(request, "authorization") ?? "");
+  let password = null;
+  if (match) {
+    const decoded = Buffer.from(match[1], "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+    if (separator !== -1) password = decoded.slice(separator + 1);
+  }
+  const expected = Buffer.from(sharedSecret, "utf8");
+  const provided = Buffer.from(password ?? "", "utf8");
+  if (
+    password === null
+    || provided.length !== expected.length
+    || !timingSafeEqual(provided, expected)
+  ) {
+    throw new ApiError(401, "UNAUTHORIZED", "Shared key authentication is required");
+  }
+}
+
+function actorFromRequest(request, authenticatedDevice = null) {
   if (request.headers["x-taskboard-client"] === "taskctl") {
     return CODEX_AGENT_ACTOR;
+  }
+  // Per-device authentication pins the acting identity to the credential itself.
+  if (authenticatedDevice) {
+    return {
+      type: "user",
+      id: authenticatedDevice.id,
+      name: authenticatedDevice.name,
+      avatarUrl: null,
+    };
   }
 
   const rawId = requestHeader(request, "x-taskboard-user-id");
@@ -1328,7 +1398,7 @@ async function resolveComposerRebindWorkspace(aiChat, input) {
   let thread;
   if (input.threadId !== undefined) {
     try {
-      thread = aiChat.getThread(input.threadId);
+      thread = await aiChat.getThread(input.threadId);
     } catch (error) {
       if (error instanceof ApiError && error.code === "AI_CHAT_THREAD_NOT_FOUND") {
         throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer thread does not exist");
@@ -1466,8 +1536,13 @@ function parseComposerTurn(body) {
 }
 
 class EventHub {
-  constructor() {
+  constructor({ publisher = null } = {}) {
     this.clients = new Set();
+    this.revision = 0;
+    this.revisionSink = null;
+    // publisher set => PostgreSQL mode: envelopes are committed to the shared event log and
+    // fanned out via PgEventBus on every replica; emit() itself does not deliver locally.
+    this.publisher = publisher;
     this.keepAlive = setInterval(() => {
       for (const response of this.clients) response.write(": keep-alive\n\n");
     }, 20_000);
@@ -1494,8 +1569,25 @@ class EventHub {
       ...value,
       at: new Date().toISOString(),
     };
-    const message = `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
+    if (!this.publisher) {
+      this.deliver(event, null);
+      return;
+    }
+    this.publisher.publish(event).catch((error) => {
+      console.error(`taskboard event publish failed for ${type}`, error);
+    });
+  }
+
+  // Fan-out entry point. Locally-written SQLite events pass revision=null (in-memory counter);
+  // PostgreSQL deliveries carry the authoritative shared sequence number.
+  deliver(event, revision) {
+    const message = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
     for (const response of this.clients) response.write(message);
+    if (revision === null || revision === undefined) {
+      this.revision += 1;
+      revision = this.revision;
+    }
+    if (this.revisionSink) this.revisionSink(revision);
   }
 
   close() {
@@ -1691,8 +1783,12 @@ export function resolveServerOptions(options = {}) {
   if (instanceToken && !/^[a-f0-9-]{32,128}$/i.test(instanceSecret)) {
     throw new Error("CODEX_TASKBOARD_INSTANCE_SECRET must be set in launcher mode");
   }
+  const sharedSecret = String(
+    options.sharedSecret ?? environment.CODEX_TASKBOARD_SHARED_SECRET ?? "",
+  ).trim();
   return {
     dataDirectory,
+    databaseUrl: options.databaseUrl ?? environment.DATABASE_URL ?? null,
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
@@ -1709,7 +1805,9 @@ export function resolveServerOptions(options = {}) {
       ?? path.join(codexHome, "process_manager", "chat_processes.json"),
     instanceToken,
     instanceSecret,
+    sharedSecret: sharedSecret || null,
     trustedOrigins: parseTrustedOrigins(environment[TRUSTED_ORIGINS_ENV]),
+    trustedHosts: parseTrustedHosts(environment[TRUSTED_HOSTS_ENV]),
     version: String(
       options.version ?? environment.CODEX_TASKBOARD_VERSION ?? "development",
     ).trim(),
@@ -1738,8 +1836,52 @@ export function createTaskboardServer(options = {}) {
     options.processEnv ?? process.env,
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
-  const database = new TaskboardDatabase(resolved.databasePath);
-  const events = new EventHub();
+  let pgEventBus = null;
+  const database = resolved.databaseUrl
+    ? new PgTaskboardDatabase(resolved.databaseUrl)
+    : new TaskboardDatabase(resolved.databasePath, {
+      attachmentsDirectory: resolved.attachmentsDirectory,
+    });
+  if (resolved.databaseUrl) {
+    pgEventBus = new PgEventBus({ getPool: () => database.getPool() }, {
+      onEvent: (payload, seq) => events.deliver(payload, seq),
+    });
+  }
+  const events = new EventHub({
+    publisher: pgEventBus
+      ? { publish: (envelope) => pgEventBus.publish(envelope) }
+      : null,
+  });
+
+  // Board authentication precedence: legacy shared-secret env, then per-device credentials
+  // when the PostgreSQL store backs the server; plain standalone SQLite stays open.
+  async function authenticateBoardRequest(request) {
+    if (resolved.sharedSecret) {
+      assertSharedSecretRequest(request, resolved.sharedSecret);
+      return null;
+    }
+    if (resolved.databaseUrl) {
+      const credentials = parseBasicCredentials(request);
+      const device = credentials
+        ? await database.authenticateDevice(credentials.username, credentials.password)
+        : null;
+      if (!device) {
+        throw new ApiError(401, "UNAUTHORIZED", "Device credentials are required");
+      }
+      return device;
+    }
+    return null;
+  }
+
+  const realtimeRevisionSockets = new Set();
+  events.revisionSink = (revision) => {
+    const message = JSON.stringify({ type: "revision", revision });
+    for (const webSocket of realtimeRevisionSockets) {
+      try {
+        webSocket.send(message);
+      } catch {}
+    }
+  };
   let clientStorageWrite = Promise.resolve();
 
   async function readClientStorage() {
@@ -1822,8 +1964,8 @@ export function createTaskboardServer(options = {}) {
         candidate.type === "worktree" && candidate.branch === context.branch
       )) ?? null;
     },
-    assertTaskProjectMoveAllowed: (taskId, targetProjectId) => {
-      if (!database.hasAiChatThreadProjectConflict(taskId, targetProjectId)) return;
+    assertTaskProjectMoveAllowed: async (taskId, targetProjectId) => {
+      if (!await database.hasAiChatThreadProjectConflict(taskId, targetProjectId)) return;
       throw new CloudProxyError(
         409,
         "AI_CHAT_PROJECT_MOVE_BLOCKED",
@@ -1860,13 +2002,13 @@ export function createTaskboardServer(options = {}) {
     const config = await cloudConfig.read();
     if (!config.remoteUrl) {
       if (codexTarget?.codexProjectKind === "remote") {
-        const project = database.getProject(projectId);
+        const project = await database.getProject(projectId);
         if (!project) {
           throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
         }
         let issue;
         if (issueId !== undefined) {
-          issue = database.getTask(issueId);
+          issue = await database.getTask(issueId);
           if (!issue || issue.projectId !== projectId || issue.archivedAt != null) {
             throw new ApiError(
               404,
@@ -1895,12 +2037,12 @@ export function createTaskboardServer(options = {}) {
         resolvedWorkspace = {
           workspacePath: PROJECT_ROOT,
           addDirectories: [],
-          project: database.getProject(projectId),
+          project: await database.getProject(projectId),
         };
       }
       let issue;
       if (issueId !== undefined) {
-        issue = database.getTask(issueId);
+        issue = await database.getTask(issueId);
         if (!issue || issue.projectId !== projectId || issue.archivedAt != null) {
           throw new ApiError(
             404,
@@ -1941,6 +2083,7 @@ export function createTaskboardServer(options = {}) {
       projectId,
       project,
       config.projectMappings,
+      resolved.codexStatePath,
     );
     return { ...resolvedWorkspace, issue };
   }
@@ -2100,10 +2243,16 @@ export function createTaskboardServer(options = {}) {
         request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
       }
 
+      const gatedPathname = new URL(request.url, "http://127.0.0.1").pathname;
+      const authenticatedDevice = gatedPathname === "/health"
+        ? null
+        : await authenticateBoardRequest(request);
+
       const configuredTrustedRequest = assertTrustedNetworkRequest(
         request,
         Boolean(resolved.instanceToken),
         resolved.trustedOrigins,
+        resolved.trustedHosts,
       );
       const origin = request.headers.origin;
       const trustedEmbedOrigin = TRUSTED_EMBED_ORIGINS.has(origin)
@@ -2382,7 +2531,7 @@ export function createTaskboardServer(options = {}) {
               password,
               projects: body.projects,
             });
-            events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
+            events.emit("project.labels.updated", { project: await database.getProject(JIRA_PROJECT_ID) });
             return sendJson(response, 200, { connection });
           } catch (error) {
             if (error instanceof ApiError) throw error;
@@ -2399,7 +2548,7 @@ export function createTaskboardServer(options = {}) {
         }
         await assertEmptyRequestBody(request, "POST /api/local/jira-connection/sync");
         const connection = await jira.sync({ force: true });
-        events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
+        events.emit("project.labels.updated", { project: await database.getProject(JIRA_PROJECT_ID) });
         return sendJson(response, 200, { connection });
       }
 
@@ -2427,6 +2576,22 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { projectId, workspacePath });
       }
 
+      if (pathname === "/api/revisions") {
+        // Realtime baseline for the panel's revision WebSocket: the client opens the
+        // socket and immediately fetches this to learn the current revision. Without
+        // it the client closes its own socket and retries forever, never invalidating.
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const sinceParam = url.searchParams.get("since") ?? "0";
+        if (!/^\d+$/.test(sinceParam) || !Number.isSafeInteger(Number(sinceParam))) {
+          throw new ApiError(400, "INVALID_CURSOR", "since must be a non-negative integer");
+        }
+        const revision = events.revision;
+        return sendJson(response, 200, {
+          changed: revision > Number(sinceParam),
+          revision,
+        });
+      }
+
       if (pathname === "/api/meta") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         if ([...url.searchParams.keys()].length > 0) {
@@ -2442,8 +2607,12 @@ export function createTaskboardServer(options = {}) {
             ? {
               mode: "cloud",
               realtime: {
-                transport: "websocket",
-                endpoint: "/api/events",
+                // Polling, not WebSocket: the embedded panel runs in a sandboxed
+                // iframe whose local-network WebSocket connections are blocked by
+                // Chromium (ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS), while
+                // same-origin GETs to /api/revisions are allowed.
+                transport: "poll",
+                intervalMs: 2_000,
               },
               localCapabilities: { available: !configuredTrustedRequest },
             }
@@ -2503,7 +2672,7 @@ export function createTaskboardServer(options = {}) {
         const projectId = validateProjectId(
           decodeRouteSegment(projectSummaryRoute[1], "Project id"),
         );
-        return sendJson(response, 200, projectSummary.get(projectId));
+        return sendJson(response, 200, await projectSummary.get(projectId));
       }
 
       if (pathname === "/api/local/ai/threads") {
@@ -2632,7 +2801,7 @@ export function createTaskboardServer(options = {}) {
           if ([...url.searchParams.keys()].length > 0) {
             throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/projects does not accept query parameters");
           }
-          const projects = database.listProjects().map((project) => ({
+          const projects = (await database.listProjects()).map((project) => ({
             ...project,
             workspacePath: project.id === DEFAULT_PROJECT_ID
               ? null
@@ -2641,7 +2810,7 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { projects });
         }
         if (request.method === "POST") {
-          const project = database.createProject(parseProjectCreate(await readJson(request)));
+          const project = await database.createProject(parseProjectCreate(await readJson(request)));
           events.emit("project.created", { project });
           return sendJson(response, 201, { project });
         }
@@ -2661,7 +2830,7 @@ export function createTaskboardServer(options = {}) {
         }
         validateProjectId(projectId);
         if (request.method === "DELETE") {
-          database.deleteProject(projectId);
+          await database.deleteProject(projectId);
           return sendEmpty(response, 204);
         }
         return methodNotAllowed(response, ["DELETE"]);
@@ -2691,8 +2860,8 @@ export function createTaskboardServer(options = {}) {
         }
         const label = parseProjectLabel(await readJson(request));
         const project = request.method === "POST"
-          ? database.addProjectLabel(projectId, label)
-          : database.deleteProjectLabel(projectId, label);
+          ? await database.addProjectLabel(projectId, label)
+          : await database.deleteProjectLabel(projectId, label);
         events.emit("project.labels.updated", { project });
         return sendJson(response, 200, { project });
       }
@@ -2718,18 +2887,16 @@ export function createTaskboardServer(options = {}) {
         }
         const body = await readBody(request, ATTACHMENT_BODY_LIMIT, "Attachment cannot exceed 25 MiB");
         const id = randomUUID();
-        await mkdir(resolved.attachmentsDirectory, { recursive: true });
-        const storagePath = path.join(resolved.attachmentsDirectory, id);
-        await writeFile(storagePath, body, { flag: "wx" });
+        await database.blobs.put(id, body);
         let attachment;
         try {
-          attachment = database.createProjectReadmeAttachment(projectId, {
+          attachment = await database.createProjectReadmeAttachment(projectId, {
             id,
             ...metadata,
             size: body.length,
           });
         } catch (error) {
-          await unlink(storagePath);
+          await database.blobs.delete(id);
           throw error;
         }
         return sendJson(response, 201, { attachment });
@@ -2748,7 +2915,7 @@ export function createTaskboardServer(options = {}) {
         }
         validateProjectId(projectId);
         if (request.method === "GET") {
-          return sendJson(response, 200, { readme: database.getProjectReadme(projectId) });
+          return sendJson(response, 200, { readme: await database.getProjectReadme(projectId) });
         }
         if (request.method === "PUT") {
           const input = parseProjectReadmeSave(await readJson(
@@ -2756,7 +2923,7 @@ export function createTaskboardServer(options = {}) {
             PROJECT_README_BODY_LIMIT,
             "Project README request cannot exceed 3 MiB",
           ));
-          const readme = database.saveProjectReadme(projectId, input.content, input.version);
+          const readme = await database.saveProjectReadme(projectId, input.content, input.version);
           events.emit("project.readme.updated", {
             projectId,
             readmeVersion: readme.version,
@@ -2789,7 +2956,7 @@ export function createTaskboardServer(options = {}) {
               ? null
               : currentCloudConfig.projectMappings[projectId] ?? null,
           }
-          : database.getProject(projectId);
+          : await database.getProject(projectId);
         if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
         const codexProjectId = stringField(url.searchParams.get("codexProjectId") ?? null, "codexProjectId", {
           nullable: true,
@@ -2825,10 +2992,10 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "GET") {
           const filters = parseTaskFilters(url.searchParams);
           if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) await jira.sync();
-          return sendJson(response, 200, { tasks: database.listTasks(filters) });
+          return sendJson(response, 200, { tasks: await database.listTasks(filters) });
         }
         if (request.method === "POST") {
-          const actor = actorFromRequest(request);
+          const actor = actorFromRequest(request, authenticatedDevice);
           const { assigneeTarget, ...parsedInput } = parseTaskCreate(await readJson(request));
           const input = resolveInputThreadBinding(parsedInput);
           if (input.projectId === JIRA_PROJECT_ID) {
@@ -2838,7 +3005,7 @@ export function createTaskboardServer(options = {}) {
               "请在 Jira 中新建议题，Taskboard 当前只同步已分配给你的任务",
             );
           }
-          const task = database.createTask({
+          const task = await database.createTask({
             ...input,
             actor,
             assignee: resolveAssignee(assigneeTarget, actor),
@@ -2888,14 +3055,14 @@ export function createTaskboardServer(options = {}) {
           const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
             parseRelationMutation(await readJson(request)),
           );
-          const result = database.addTaskRelation(
+          const result = await database.addTaskRelation(
             taskId,
             version,
             relationType,
             relatedTaskId,
             threadId,
             threadBinding,
-            actorFromRequest(request),
+            actorFromRequest(request, authenticatedDevice),
             origin,
           );
           events.emit("task.relation.updated", result);
@@ -2905,14 +3072,14 @@ export function createTaskboardServer(options = {}) {
           const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
             parseRelationMutation(await readJson(request)),
           );
-          const result = database.removeTaskRelation(
+          const result = await database.removeTaskRelation(
             taskId,
             version,
             relationType,
             relatedTaskId,
             threadId,
             threadBinding,
-            actorFromRequest(request),
+            actorFromRequest(request, authenticatedDevice),
             origin,
           );
           events.emit("task.relation.updated", result);
@@ -2936,7 +3103,7 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Activity routes do not accept query parameters");
         }
         if (request.method === "GET") {
-          return sendJson(response, 200, { activities: database.listTaskActivities(taskId) });
+          return sendJson(response, 200, { activities: await database.listTaskActivities(taskId) });
         }
         return methodNotAllowed(response, ["GET"]);
       }
@@ -2954,9 +3121,9 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "GET") {
           const after = parseAfterCursor(url.searchParams, "Comment routes");
-          const comments = after
+          const comments = await (after
             ? database.listCommentsAfter(taskId, after)
-            : database.listComments(taskId);
+            : database.listComments(taskId));
           return sendJson(response, 200, {
             comments,
             nextCursor: nextCursor(comments, after),
@@ -2966,11 +3133,11 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const comment = database.createComment(taskId, {
+          const comment = await database.createComment(taskId, {
             ...resolveInputThreadBinding(parseCommentCreate(await readJson(request))),
-            actor: actorFromRequest(request),
+            actor: actorFromRequest(request, authenticatedDevice),
           });
-          const task = database.getTask(taskId);
+          const task = await database.getTask(taskId);
           events.emit("comment.created", { comment, task });
           return sendJson(response, 201, { comment });
         }
@@ -2993,28 +3160,24 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "PATCH") {
           const patch = resolveInputThreadBinding(parseCommentPatch(await readJson(request)));
-          const comment = database.updateComment(
+          const comment = await database.updateComment(
             id,
             patch.version,
             patch.body,
             patch.threadId,
             patch.threadBinding,
           );
-          const task = database.getTask(comment.taskId);
+          const task = await database.getTask(comment.taskId);
           events.emit("comment.updated", { comment, task });
           return sendJson(response, 200, { comment });
         }
         if (request.method === "DELETE") {
           const { version } = parseArchive(await readJson(request));
-          const comment = database.deleteComment(id, version);
+          const comment = await database.deleteComment(id, version);
           for (const attachment of comment.attachments) {
-            try {
-              await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
-            } catch (error) {
-              if (error.code !== "ENOENT") throw error;
-            }
+            await database.blobs.delete(attachment.id);
           }
-          const task = database.getTask(comment.taskId);
+          const task = await database.getTask(comment.taskId);
           events.emit("comment.deleted", { comment, task });
           return sendEmpty(response, 204);
         }
@@ -3034,7 +3197,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "GET") {
           const after = parseAfterCursor(url.searchParams, "Attachment routes");
-          const attachments = database.listCommentAttachments(commentId, after);
+          const attachments = await database.listCommentAttachments(commentId, after);
           return sendJson(response, 200, {
             attachments,
             nextCursor: nextCursor(attachments, after),
@@ -3044,23 +3207,21 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Attachment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const comment = database.getComment(commentId);
+          const comment = await database.getComment(commentId);
           if (!comment) throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${commentId}' does not exist`);
           const metadata = parseAttachmentHeaders(request);
           const body = await readBody(request, ATTACHMENT_BODY_LIMIT, "Attachment cannot exceed 25 MiB");
           const id = randomUUID();
-          await mkdir(resolved.attachmentsDirectory, { recursive: true });
-          const storagePath = path.join(resolved.attachmentsDirectory, id);
-          await writeFile(storagePath, body, { flag: "wx" });
+          await database.blobs.put(id, body);
           let attachment;
           try {
-            attachment = database.createCommentAttachment(commentId, { id, ...metadata, size: body.length });
+            attachment = await database.createCommentAttachment(commentId, { id, ...metadata, size: body.length });
           } catch (error) {
-            await unlink(storagePath);
+            await database.blobs.delete(id);
             throw error;
           }
-          const task = database.getTask(comment.taskId);
-          events.emit("attachment.created", { attachment, comment: database.getComment(commentId), task });
+          const task = await database.getTask(comment.taskId);
+          events.emit("attachment.created", { attachment, comment: await database.getComment(commentId), task });
           return sendJson(response, 201, { attachment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -3079,7 +3240,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "GET") {
           const after = parseAfterCursor(url.searchParams, "Attachment routes");
-          const attachments = database.listAttachments(taskId, after);
+          const attachments = await database.listAttachments(taskId, after);
           return sendJson(response, 200, {
             attachments,
             nextCursor: nextCursor(attachments, after),
@@ -3089,19 +3250,17 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Attachment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const task = database.getTask(taskId);
+          const task = await database.getTask(taskId);
           if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
           const metadata = parseAttachmentHeaders(request);
           const body = await readBody(request, ATTACHMENT_BODY_LIMIT, "Attachment cannot exceed 25 MiB");
           const id = randomUUID();
-          await mkdir(resolved.attachmentsDirectory, { recursive: true });
-          const storagePath = path.join(resolved.attachmentsDirectory, id);
-          await writeFile(storagePath, body, { flag: "wx" });
+          await database.blobs.put(id, body);
           let attachment;
           try {
-            attachment = database.createAttachment(taskId, { id, ...metadata, size: body.length });
+            attachment = await database.createAttachment(taskId, { id, ...metadata, size: body.length });
           } catch (error) {
-            await unlink(storagePath);
+            await database.blobs.delete(id);
             throw error;
           }
           events.emit("attachment.created", { attachment, task });
@@ -3127,9 +3286,10 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "GET" && request.method !== "HEAD") {
           return methodNotAllowed(response, ["GET", "HEAD"]);
         }
-        const attachment = database.getAttachment(id) ?? database.getProjectReadmeAttachment(id);
+        const attachment = await database.getAttachment(id) ?? await database.getProjectReadmeAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
-        const body = await readFile(path.join(resolved.attachmentsDirectory, attachment.id));
+        const body = await database.blobs.get(attachment.id);
+        if (!body) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
         const encodedFilename = encodeURIComponent(attachment.filename).replace(/['()*]/g, (character) => (
           `%${character.charCodeAt(0).toString(16).toUpperCase()}`
         ));
@@ -3164,15 +3324,11 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Attachment routes do not accept query parameters");
         }
         if (request.method !== "DELETE") return methodNotAllowed(response, ["DELETE"]);
-        const attachment = database.getAttachment(id);
+        const attachment = await database.getAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
-        try {
-          await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
-        } catch (error) {
-          if (error.code !== "ENOENT") throw error;
-        }
-        database.deleteAttachment(id);
-        const task = database.getTask(attachment.taskId);
+        await database.blobs.delete(attachment.id);
+        await database.deleteAttachment(id);
+        const task = await database.getTask(attachment.taskId);
         events.emit("attachment.deleted", { attachment, task });
         return sendEmpty(response, 204);
       }
@@ -3190,7 +3346,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         const { direction, depth } = parseTaskTreeQuery(url.searchParams);
-        return sendJson(response, 200, { tree: database.getTaskTree(id, direction, depth) });
+        return sendJson(response, 200, { tree: await database.getTaskTree(id, direction, depth) });
       }
 
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
@@ -3209,12 +3365,12 @@ export function createTaskboardServer(options = {}) {
           if ([...url.searchParams.keys()].length > 0) {
             throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/tasks/:id does not accept query parameters");
           }
-          const task = database.getTask(id);
+          const task = await database.getTask(id);
           if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           return sendJson(response, 200, { task });
         }
         if (!action && request.method === "PATCH") {
-          const actor = actorFromRequest(request);
+          const actor = actorFromRequest(request, authenticatedDevice);
           const {
             version,
             changes,
@@ -3222,7 +3378,7 @@ export function createTaskboardServer(options = {}) {
             threadBinding,
             assigneeTarget,
           } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
-          const current = database.getTask(id);
+          const current = await database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           let jiraChanged = false;
           if (current.source !== "jira" && changes.projectId === JIRA_PROJECT_ID) {
@@ -3262,7 +3418,7 @@ export function createTaskboardServer(options = {}) {
           }
           let task;
           try {
-            task = database.updateTask(id, version, changes, threadId, threadBinding, actor);
+            task = await database.updateTask(id, version, changes, threadId, threadBinding, actor);
           } catch (error) {
             if (jiraChanged) {
               try {
@@ -3281,25 +3437,21 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { task });
         }
         if (!action && request.method === "DELETE") {
-          const current = database.getTask(id);
+          const current = await database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_DELETE_UNAVAILABLE", "Jira 任务不能从 Taskboard 永久删除");
           }
           const { version } = parseArchive(await readJson(request));
-          const deleted = database.deleteArchivedTask(id, version);
+          const deleted = await database.deleteArchivedTask(id, version);
           for (const attachmentId of deleted.attachmentIds) {
-            try {
-              await unlink(path.join(resolved.attachmentsDirectory, attachmentId));
-            } catch (error) {
-              if (error.code !== "ENOENT") throw error;
-            }
+            await database.blobs.delete(attachmentId);
           }
           events.emit("task.deleted", { task: deleted.task });
           return sendEmpty(response, 204);
         }
         if (action === "move" && request.method === "POST") {
           const move = resolveInputThreadBinding(parseMove(await readJson(request)));
-          const current = database.getTask(id);
+          const current = await database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           if (current.source === "jira") {
             if (current.version !== move.version) {
@@ -3313,50 +3465,50 @@ export function createTaskboardServer(options = {}) {
             }
             await jira.moveTask(current, move.status);
           }
-          const task = database.moveTask(
+          const task = await database.moveTask(
             id,
             move.version,
             move.status,
             move.sortOrder,
             move.threadId,
             move.threadBinding,
-            actorFromRequest(request),
+            actorFromRequest(request, authenticatedDevice),
           );
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });
         }
         if (action === "archive" && request.method === "POST") {
-          const current = database.getTask(id);
+          const current = await database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_ARCHIVE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动归档");
           }
           const { version, threadId, threadBinding } = resolveInputThreadBinding(
             parseArchive(await readJson(request)),
           );
-          const task = database.archiveTask(
+          const task = await database.archiveTask(
             id,
             version,
             threadId,
             threadBinding,
-            actorFromRequest(request),
+            actorFromRequest(request, authenticatedDevice),
           );
           events.emit("task.archived", { task });
           return sendJson(response, 200, { task });
         }
         if (action === "restore" && request.method === "POST") {
-          const current = database.getTask(id);
+          const current = await database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
           }
           const { version, threadId, threadBinding } = resolveInputThreadBinding(
             parseArchive(await readJson(request)),
           );
-          const task = database.restoreTask(
+          const task = await database.restoreTask(
             id,
             version,
             threadId,
             threadBinding,
-            actorFromRequest(request),
+            actorFromRequest(request, authenticatedDevice),
           );
           events.emit("task.restored", { task });
           return sendJson(response, 200, { task });
@@ -3377,7 +3529,9 @@ export function createTaskboardServer(options = {}) {
       if (error instanceof ApiError) {
         const payload = { error: { code: error.code, message: error.message } };
         if (error.details !== undefined) payload.error.details = error.details;
-        sendJson(response, error.status, payload);
+        sendJson(response, error.status, payload, error.status === 401
+          ? { "www-authenticate": 'Basic realm="Codex Taskboard", charset="UTF-8"' }
+          : {});
         return;
       }
       if (error instanceof CloudProxyError) {
@@ -3392,7 +3546,6 @@ export function createTaskboardServer(options = {}) {
   });
 
   const cloudRealtimeServer = new WebSocketServer({ noServer: true });
-  const cloudRealtimeSockets = new Set();
 
   function rejectWebSocketUpgrade(socket, status, message) {
     const body = `${message}\n`;
@@ -3418,8 +3571,71 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
+  // Cloud realtime consumer: continuously tails the remote board's authenticated SSE
+  // stream and re-publishes each event into the local EventHub. Running it as a
+  // service-level singleton (not per client connection) keeps `events.revision` the
+  // single source of truth that both /api/revisions polling and local fanout read.
+  let cloudRealtimeStop = null;
+  async function startCloudRealtimeConsumer() {
+    const controller = new AbortController();
+    cloudRealtimeStop = () => controller.abort();
+    void (async () => {
+      while (!controller.signal.aborted) {
+        let target;
+        try {
+          target = await cloudProxy.eventStreamTarget("/api/events");
+        } catch {
+          // No cloud session (yet) — retry in case one is configured later.
+          await new Promise((resolve) => setTimeout(resolve, 5_000));
+          continue;
+        }
+        try {
+          const response = await fetch(target.url, {
+            headers: target.headers,
+            signal: controller.signal,
+          });
+          if (!response.ok || !response.body) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let streaming = true;
+          while (streaming && !controller.signal.aborted) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf("\n\n");
+            while (boundary !== -1) {
+              const block = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              const data = block.split("\n")
+                .filter((line) => line.startsWith("data: "))
+                .map((line) => line.slice(6))
+                .join("\n");
+              if (data) {
+                try {
+                  const payload = JSON.parse(data);
+                  if (payload && typeof payload.type === "string") {
+                    events.deliver(payload, null);
+                  }
+                } catch {
+                  // A malformed upstream event should not break the stream.
+                }
+              }
+              boundary = buffer.indexOf("\n\n");
+            }
+          }
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          console.error(`Cloud realtime stream failed: ${error?.message ?? error}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+    })();
+  }
+
   server.on("upgrade", async (request, socket, head) => {
-    let remoteSocket;
     try {
       const incomingUrl = new URL(request.url, "http://127.0.0.1");
       if (resolved.instanceToken) {
@@ -3429,79 +3645,29 @@ export function createTaskboardServer(options = {}) {
         }
         request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
       }
+      await authenticateBoardRequest(request);
       assertTrustedNetworkRequest(
         request,
         Boolean(resolved.instanceToken),
         resolved.trustedOrigins,
+        resolved.trustedHosts,
       );
       const url = new URL(request.url, "http://127.0.0.1");
       if (url.pathname !== "/api/events" || [...url.searchParams.keys()].length > 0) {
         rejectWebSocketUpgrade(socket, 404, "Not Found");
         return;
       }
-      assertLoopbackRequest(request);
-      const target = await cloudProxy.webSocketTarget("/api/events");
-      remoteSocket = new WebSocketClient(target.url, { headers: target.headers });
-      const pendingMessages = [];
-      const queueMessage = (data, isBinary) => pendingMessages.push({ data, isBinary });
-      remoteSocket.on("message", queueMessage);
-      await new Promise((resolve, reject) => {
-        const cleanup = () => {
-          remoteSocket.off("open", onOpen);
-          remoteSocket.off("error", onError);
-          remoteSocket.off("close", onClose);
-        };
-        const onOpen = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = (error) => {
-          cleanup();
-          reject(error);
-        };
-        const onClose = () => {
-          cleanup();
-          reject(new Error("Cloud realtime connection closed before opening"));
-        };
-        remoteSocket.once("open", onOpen);
-        remoteSocket.once("error", onError);
-        remoteSocket.once("close", onClose);
-      });
+      // In cloud mode the browser-facing realtime transport is /api/revisions polling
+      // (a sandboxed panel iframe cannot open local-network WebSockets), so upgrades
+      // are only served by the local revision fanout regardless of cloud config.
       cloudRealtimeServer.handleUpgrade(request, socket, head, (localSocket) => {
-        const pair = { localSocket, remoteSocket };
-        cloudRealtimeSockets.add(pair);
-        const removePair = () => cloudRealtimeSockets.delete(pair);
-        const forwardMessage = (data, isBinary) => {
-          if (localSocket.readyState === WebSocketClient.OPEN) {
-            localSocket.send(data, { binary: isBinary });
-          }
-        };
-
-        remoteSocket.off("message", queueMessage);
-        remoteSocket.on("message", forwardMessage);
-        for (const { data, isBinary } of pendingMessages) forwardMessage(data, isBinary);
-
+        realtimeRevisionSockets.add(localSocket);
         localSocket.on("message", () => {
           localSocket.close(1008, "Client messages are not supported");
         });
-        localSocket.on("close", (code, reason) => {
-          removePair();
-          closeOrTerminateWebSocket(remoteSocket, code, reason);
-        });
-        localSocket.on("error", () => remoteSocket.terminate());
-
-        remoteSocket.on("close", (code, reason) => {
-          removePair();
-          closeOrTerminateWebSocket(localSocket, code, reason);
-        });
-        remoteSocket.on("error", () => {
-          if (localSocket.readyState === WebSocketClient.OPEN) {
-            localSocket.close(1011, "Cloud realtime connection failed");
-          }
-        });
+        localSocket.on("close", () => realtimeRevisionSockets.delete(localSocket));
       });
     } catch (error) {
-      remoteSocket?.terminate();
       rejectWebSocketUpgrade(socket, error?.status ?? 502, "WebSocket connection failed");
     }
   });
@@ -3519,6 +3685,13 @@ export function createTaskboardServer(options = {}) {
       if (fd !== null && (!Number.isInteger(fd) || fd < 3 || fd > 255)) {
         throw new Error("Taskboard server listen fd must be an inherited file descriptor");
       }
+      if (pgEventBus) {
+        // Replica-safe startup sweep: interrupt running turns owned by this instance
+        // (plus NULL rows left by the migration importer) before accepting traffic.
+        await database.interruptAbandonedAiChatRuns({ runnerHost: database.runnerHost });
+        await pgEventBus.start();
+      }
+      void startCloudRealtimeConsumer();
       await new Promise((resolve, reject) => {
         const onError = (error) => {
           server.off("listening", onListening);
@@ -3537,11 +3710,10 @@ export function createTaskboardServer(options = {}) {
       return server.address();
     },
     async close() {
-      for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
-        localSocket.terminate();
-        remoteSocket.terminate();
-      }
-      cloudRealtimeSockets.clear();
+      if (pgEventBus) await pgEventBus.close().catch(() => {});
+      if (cloudRealtimeStop) cloudRealtimeStop();
+      for (const webSocket of realtimeRevisionSockets) webSocket.terminate();
+      realtimeRevisionSockets.clear();
       cloudRealtimeServer.close();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {
@@ -3555,7 +3727,7 @@ export function createTaskboardServer(options = {}) {
       await projectSummary.close();
       await serverClosed;
       listening = false;
-      database.close();
+      await database.close();
     },
   };
 }

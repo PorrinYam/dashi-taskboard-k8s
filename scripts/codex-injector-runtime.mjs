@@ -149,6 +149,7 @@ export async function reconcileInjectionRuntime({
   currentStatus,
   source,
   sourceHash,
+  taskboardPageUrl = null,
   removeRegisteredSource,
   registerCurrentSource,
   evaluateCurrentSource,
@@ -164,8 +165,21 @@ export async function reconcileInjectionRuntime({
   await evaluateCurrentSource(source);
   await publishRegistration(scriptIdentifier);
   const replaced = currentStatus.sourceHash !== sourceHash;
+  // A visible frame pointing at a stale instance URL (the launcher rotates the
+  // instance token on every app restart) would never refresh on its own — force
+  // the freshly-evaluated script to reopen so the frame re-targets the live URL.
+  const frameUrl = typeof currentStatus.frameUrl === "string" ? currentStatus.frameUrl : "";
+  const expectedFramePrefix = taskboardPageUrl
+    ? (taskboardPageUrl.endsWith("/") ? taskboardPageUrl : `${taskboardPageUrl}/`)
+    : null;
+  const staleFrame = Boolean(
+    expectedFramePrefix
+    && frameUrl
+    && frameUrl !== "about:blank"
+    && !frameUrl.startsWith(expectedFramePrefix),
+  );
   const shouldRemainOpen = currentStatus.pageVisible === true;
-  if (replaced && shouldRemainOpen) await reopen();
+  if ((replaced || staleFrame) && shouldRemainOpen) await reopen();
   return { replaced, scriptIdentifier, shouldRemainOpen };
 }
 

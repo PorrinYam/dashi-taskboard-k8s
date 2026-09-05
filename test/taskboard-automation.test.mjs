@@ -261,7 +261,7 @@ test("the generated cron spec uses the selected whitelisted local Codex options"
   });
 });
 
-test("passive policy checks resume only after quota recovery", () => {
+test("passive policy keeps user intent while pausing only for real runtime conditions", () => {
   const passiveAvailable = {
     explicit: false,
     previousQuotaState: "available",
@@ -273,14 +273,14 @@ test("passive policy checks resume only after quota recovery", () => {
       { ...baseRequest, quotaAware: true },
       passiveAvailable,
     ),
-    "list",
+    "ensure-active",
   );
   assert.equal(
     taskboardAutomationPolicyOperation(
       { ...baseRequest, quotaAware: true },
       { ...passiveAvailable, quotaState: "unknown" },
     ),
-    "list",
+    "pause",
   );
   assert.equal(
     taskboardAutomationPolicyOperation(

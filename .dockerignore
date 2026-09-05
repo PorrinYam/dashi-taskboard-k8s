@@ -1,0 +1,12 @@
+# Keep the docker build context small and free of local data.
+# The image build only needs: package.json, package-lock.json, web/, shared/,
+# server/, cli/, skills/ — see deploy/Dockerfile.
+.git
+.data
+node_modules
+dist
+.wrangler
+src-tauri
+cloud
+cloud-migration-exports
+test

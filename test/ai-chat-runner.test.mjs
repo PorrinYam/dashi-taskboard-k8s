@@ -706,6 +706,71 @@ test("unsupported composer nodes fail with the stable code before a run starts",
   }
 });
 
+test("SQLite composer turns persist a new Codex thread id without requiring a Promise return", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-composer-sqlite-"));
+  const workspacePath = path.join(directory, "workspace");
+  await mkdir(workspacePath);
+  const workspace = await realpath(workspacePath);
+  const codexStatePath = path.join(directory, "codex-state.json");
+  await writeFile(codexStatePath, JSON.stringify({
+    "local-projects": { project: { rootPaths: [workspace] } },
+  }));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  database.createProject({ id: "project", name: "Project", workspacePath: null });
+  let notificationListener = () => {};
+  const appServer = {
+    subscribe(listener) {
+      notificationListener = listener;
+      return () => { notificationListener = () => {}; };
+    },
+    async startThread() {
+      return { thread: { id: "app-server-thread" } };
+    },
+    async startTurn() {
+      setTimeout(() => notificationListener({
+        method: "turn/completed",
+        params: {
+          threadId: "app-server-thread",
+          turnId: "app-server-turn",
+          turn: { id: "app-server-turn", status: "completed" },
+        },
+      }), 0);
+      return { turn: { id: "app-server-turn" } };
+    },
+    async interruptTurn() {},
+    async close() {},
+  };
+  const service = new AiChatService({
+    database,
+    codexExecutable: "/unused/codex",
+    codexStatePath,
+    manageTaskboardSkillPath: "/fixture/manage-taskboard/SKILL.md",
+    appServer,
+  });
+  const thread = database.createAiChatThread({
+    id: "composer-thread",
+    title: "Composer thread",
+    origin: { projectId: "project", projectName: "Project", workspacePath: workspace },
+    model: "gpt-real",
+    reasoningEffort: "medium",
+    sandbox: "workspace-write",
+  });
+
+  try {
+    const run = await service.startTurn(thread.id, {
+      contractVersion: "composer.v1",
+      revision: "text-only",
+      document: { version: 1, nodes: [{ type: "text", text: "import tasks" }] },
+    });
+    await waitFor(() => service.getRun(run.id)?.status === "completed");
+    assert.equal(database.getAiChatThread(thread.id).codexThreadId, "app-server-thread");
+  } finally {
+    await service.close();
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 async function createFixture() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-ai-runner-"));
   const workspacePath = path.join(directory, "workspace");

@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskboard
+  annotations:
+    # SSE (/api/events) must stream unbuffered, or live board updates stall.
+    # Both annotations are nginx-ingress specific and ignored by other controllers.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: __INGRESS_CLASS__
+  tls:
+    # tls-begin
+    - hosts:
+        - __BOARD_HOST__
+      secretName: __TLS_SECRET__
+    # tls-end
+  rules:
+    - host: __BOARD_HOST__
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: taskboard
+                port:
+                  number: 80

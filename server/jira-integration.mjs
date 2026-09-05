@@ -261,7 +261,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       await assertLiveOrigin(config);
       issues = await fetchAssignedIssues(config);
     }
-    database.syncJiraTasks(
+    await database.syncJiraTasks(
       issues.map((issue, index) => normalizeIssue(issue, config, index)),
       { archiveMissing, projectName: `Jira · ${config.displayName}`, legacyIdentity },
     );
@@ -375,7 +375,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       const legacyIdentity = current?.version === 1
         ? { urlHash: legacyJiraOriginId(current.baseUrl), originId: config.originId }
         : null;
-      database.syncJiraTasks(
+      await database.syncJiraTasks(
         issues.map((issue, index) => normalizeIssue(issue, config, index)),
         {
           archiveMissing: true,

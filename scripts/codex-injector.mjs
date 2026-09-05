@@ -1917,13 +1917,6 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         },
       );
       if (result.stale) return result;
-      if (result.hasTodo === false && result.operation === "pause") {
-        current.version += 1;
-        current.request = { ...current.request, enabledByUser: false };
-      } else if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
-        current.version += 1;
-        current.request = { ...current.request, enabledByUser: false };
-      }
       if (result.item?.id) {
         current.request = { ...current.request, automationId: result.item.id };
       }
@@ -2538,6 +2531,7 @@ async function injectTarget(
         currentStatus,
         source,
         sourceHash,
+        taskboardPageUrl,
         removeRegisteredSource: (identifier) => cdp.send(
           "Page.removeScriptToEvaluateOnNewDocument",
           { identifier },
@@ -2799,6 +2793,7 @@ async function main() {
   };
   let taskboardChild = null;
   let idleAfterNormalExit = false;
+  let lastPairingRecoveryLogAt = 0;
   let openRequestGeneration = options.open ? 1 : 0;
   let openedRequestGeneration = 0;
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
@@ -3253,6 +3248,50 @@ async function main() {
         try {
           await connection.hostBridge?.publishHeartbeat();
         } catch (_) {}
+      }
+      // Pairing self-healing: heartbeat timeouts close the underlying CDP session, so a
+      // replaced or crashed renderer leaves an empty session map behind while this
+      // process (and the launcher) stay alive. Re-establish against whatever Codex is
+      // running instead of idling until a manual app restart:
+      // - a debuggable renderer is re-adopted with full injection (attachExisting);
+      // - a plain renderer (no debug port) degrades to the native-board deep link and
+      //   asks the launcher to surface the one-click adoption dialog;
+      // - nothing running keeps the existing wait-for-open behaviour.
+      if (!nativeCodexBrowser && !stopping && injectedTargets.size === 0) {
+        const runningCodex = codexAppProcesses(options.appPath);
+        if (runningCodex.length > 0) {
+          const now = Date.now();
+          if (now - lastPairingRecoveryLogAt > 15_000) {
+            lastPairingRecoveryLogAt = now;
+            console.error("Codex pairing lost; re-establishing the Taskboard session.");
+          }
+          cdpRuntime?.close?.();
+          cdpRuntime = null;
+          let started = false;
+          try {
+            started = await startManagedCodex();
+          } catch (restartError) {
+            console.error(`Waiting to re-establish Codex: ${restartError.message}`);
+          }
+          if (!started) {
+            if (nativeCodexBrowser) {
+              // Degraded because the running Codex is a plain instance (no debug port):
+              // ask the launcher to surface the adoption dialog so one confirmation
+              // restores the injected sidebar entry without restarting the app.
+              console.log(JSON.stringify({
+                plainCodexAdoptionRequested: true,
+                pids: runningCodex.map((record) => record.pid),
+              }));
+            } else {
+              idleAfterNormalExit = true;
+            }
+            if (hasOpenPending()) await requestTaskboardOpen().catch(() => {});
+            continue;
+          }
+          idleAfterNormalExit = false;
+          // Fall through: injectAll below attaches the fresh runtime this very tick;
+          // continuing here would re-enter this branch with an empty map forever.
+        }
       }
       if (nativeCodexBrowser) {
         if (codexAppProcesses(options.appPath).length === 0) {

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { WebSocket, WebSocketServer } from "ws";
+import { WebSocket } from "ws";
 
 import { main } from "../cli/taskctl.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
@@ -315,6 +315,59 @@ test("cloud companion blocks project moves for issue-linked local AI chats", asy
   }
 });
 
+test("cloud AI catalog accepts an exact Codex-registered project without a manual mapping", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-ai-catalog-"));
+  temporaryDirectories.push(directory);
+  const workspace = path.join(directory, "workspace");
+  await mkdir(workspace);
+  const projectId = "local-codex-project";
+  const codexStatePath = path.join(directory, "codex-state.json");
+  await writeFile(codexStatePath, JSON.stringify({
+    "local-projects": { [projectId]: { rootPaths: [workspace] } },
+  }));
+  const codexExecutable = path.join(directory, "fake-codex.mjs");
+  await writeFile(codexExecutable, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "debug") {
+  process.stdout.write('{"models":[{"slug":"gpt-real","display_name":"GPT Real","description":"","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"service_tiers":[]}]}');
+} else if (args[0] === "app-server") {
+  process.stdin.setEncoding("utf8"); let buffer = "";
+  process.stdin.on("data", chunk => { buffer += chunk; let index;
+    while ((index = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
+      if (!line.trim()) continue; const message = JSON.parse(line);
+      if (message.id === 1) process.stdout.write('{"id":1,"result":{}}\\n');
+      if (message.id === 2) process.stdout.write('{"id":2,"result":{"data":[]}}\\n');
+    }
+  });
+}
+`);
+  await chmod(codexExecutable, 0o755);
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable,
+    codexStatePath,
+    cloudConfigStore: memoryConfigStore(),
+    remoteFetch: async (url) => {
+      if (new URL(url).pathname === "/api/projects") {
+        return jsonResponse({ projects: [{ id: projectId, name: "Codex Project" }] });
+      }
+      return jsonResponse({ error: { code: "NOT_FOUND", message: "Not found" } }, 404);
+    },
+  });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/local/ai/catalog?projectId=${projectId}`,
+    );
+    const catalog = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(catalog.models[0].slug, "gpt-real");
+  } finally {
+    await app.close();
+  }
+});
+
 test("configured cloud mode fails explicitly and never falls back to the local database", async () => {
   const { createCloudProxy } = await importCloudProxy();
   let upstreamCalls = 0;
@@ -393,12 +446,12 @@ test("cloud proxy does not forward browser compression negotiation upstream", as
   assert.deepEqual(await response.json(), { projects: [] });
 });
 
-test("cloud proxy builds an authenticated WebSocket target without exposing credentials in the URL", async () => {
+test("cloud proxy builds an authenticated SSE event-stream target without exposing credentials in the URL", async () => {
   const { createCloudProxy } = await importCloudProxy();
   const proxy = createCloudProxy({ configStore: memoryConfigStore() });
-  const target = await proxy.webSocketTarget();
+  const target = await proxy.eventStreamTarget();
 
-  assert.equal(target.url, "wss://tasks.example.test/api/events");
+  assert.equal(target.url, "https://tasks.example.test/api/events");
   assert.equal(
     target.headers.authorization,
     `Basic ${Buffer.from("Alice:two-person-shared-key").toString("base64")}`,
@@ -406,17 +459,15 @@ test("cloud proxy builds an authenticated WebSocket target without exposing cred
   assert.doesNotMatch(target.url, /Alice|two-person-shared-key/);
 });
 
-test("local companion relays authenticated cloud revision WebSockets", async () => {
+test("local companion relays authenticated cloud realtime events over SSE", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-websocket-"));
   temporaryDirectories.push(directory);
   const upstreamServer = createServer();
-  const upstreamWebSockets = new WebSocketServer({ noServer: true });
   let receivedAuthorization = null;
-  upstreamServer.on("upgrade", (request, socket, head) => {
+  upstreamServer.on("request", (request, response) => {
     receivedAuthorization = request.headers.authorization ?? null;
-    upstreamWebSockets.handleUpgrade(request, socket, head, (webSocket) => {
-      webSocket.send(JSON.stringify({ type: "revision", revision: 42 }));
-    });
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`event: task.moved\ndata: ${JSON.stringify({ type: "task.moved", task: { id: "t1" } })}\n\n`);
   });
   await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
   const upstreamAddress = upstreamServer.address();
@@ -439,7 +490,7 @@ test("local companion relays authenticated cloud revision WebSockets", async () 
       });
       client.once("error", reject);
     });
-    assert.deepEqual(payload, { type: "revision", revision: 42 });
+    assert.deepEqual(payload, { type: "revision", revision: 1 });
     assert.equal(
       receivedAuthorization,
       `Basic ${Buffer.from("Alice:two-person-shared-key").toString("base64")}`,
@@ -447,7 +498,6 @@ test("local companion relays authenticated cloud revision WebSockets", async () 
   } finally {
     client?.terminate();
     await app.close();
-    upstreamWebSockets.close();
     await new Promise((resolve) => upstreamServer.close(resolve));
   }
 });
@@ -654,8 +704,8 @@ test("configured server proxies business APIs without touching local rows and ad
       capabilities: { localAiChat: true },
       mode: "cloud",
       realtime: {
-        transport: "websocket",
-        endpoint: "/api/events",
+        transport: "poll",
+        intervalMs: 2000,
       },
       localCapabilities: { available: true },
       manageTaskboardSkillPath: app.options.skillPath,

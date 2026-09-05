@@ -358,6 +358,8 @@ export function spawnCodexTurn({
   let stdoutEnded = false;
   let resolveCompletion;
   let rejectCompletion;
+  // Serializes async onRawEvent callbacks so events stay ordered; drained before completion resolves.
+  let eventChain = Promise.resolve();
 
   const completion = new Promise((resolve, reject) => {
     resolveCompletion = resolve;
@@ -390,7 +392,12 @@ export function spawnCodexTurn({
       return;
     }
     try {
-      onRawEvent(raw);
+      const handled = onRawEvent(raw);
+      if (handled && typeof handled.then === "function") {
+        eventChain = eventChain.then(() => handled).catch((error) => {
+          rejectWithDiagnostic(error);
+        });
+      }
     } catch (error) {
       rejectWithDiagnostic(error);
     }
@@ -458,16 +465,18 @@ export function spawnCodexTurn({
   child.on("exit", () => child.stdio[3].destroy());
   child.on("close", (exitCode, signal) => {
     finishStdout();
-    if (settled) return;
-    settled = true;
-    if (fatalError) {
-      if (stderrBuffer.length > 0) {
-        fatalError.stderr = stderrBuffer.toString("utf8");
+    void eventChain.then(() => {
+      if (settled) return;
+      settled = true;
+      if (fatalError) {
+        if (stderrBuffer.length > 0) {
+          fatalError.stderr = stderrBuffer.toString("utf8");
+        }
+        rejectCompletion(fatalError);
+        return;
       }
-      rejectCompletion(fatalError);
-      return;
-    }
-    resolveCompletion({ exitCode, signal });
+      resolveCompletion({ exitCode, signal });
+    });
   });
   child.stdin.on("error", () => {});
   child.stdio[3].on("error", () => {});
